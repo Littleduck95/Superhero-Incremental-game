@@ -76,8 +76,12 @@ const started = Date.now();
 for (let t = 0; t < hours * 3600; t++) {
   s = E.step(s, 1, { auto: true, climb: true });
   if (patrolRate > 0 && t < 3600 * 2) {
-    const gain = E.derive(s).patrol * patrolRate;
-    s = { ...s, res: { ...s.res, leads: s.res.leads + gain, salvage: s.res.salvage + gain } };
+    const dd = E.derive(s);
+    const gain = dd.patrol * patrolRate;
+    /* patrols are income: they stop at the ceiling, same as in the game,
+       and never claw back a windfall already over it */
+    const up = (k) => (s.res[k] >= dd.caps[k] ? s.res[k] : Math.min(dd.caps[k], s.res[k] + gain));
+    s = { ...s, res: { ...s.res, leads: up("leads"), salvage: up("salvage") } };
   }
   s = staff(s);
   /* buy the cheapest affordable thing, in seconds of income, a few times */

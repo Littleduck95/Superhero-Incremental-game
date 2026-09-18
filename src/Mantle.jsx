@@ -446,6 +446,7 @@ const freshState = (legacy = 0) => ({
   patrols: 0,
   momentum: { n: 0, at: -10 },
   stakeoutAt: 0,
+  stakeArm: false,        /* a stakeout is underway; one resolve per start */
   contracts: null,        /* the board; rolled by the wall clock, not game time */
   log: [],
   time: 0,
@@ -495,6 +496,26 @@ function migrate(saved) {
     });
     back.fight = freshFight();
   }
+  /* A truncated or hand-edited save loads as a game, not a crash or a
+     NaN factory. The loader parks a save that still won't load under a
+     rescue key rather than letting the autosave pave over it. */
+  const num = (v, d0 = 0) => (Number.isFinite(v) ? v : d0);
+  for (const k of ["ranks", "tech", "cleared", "bosses", "projects", "autosell", "achieved"])
+    if (!back[k] || typeof back[k] !== "object" || Array.isArray(back[k])) back[k] = {};
+  if (!Array.isArray(back.queue)) back.queue = [];
+  for (const k of RES_IDS) back.res[k] = num(back.res[k]);
+  for (const t of TERRITORY) back.own[t.id] = num(back.own[t.id]);
+  for (const gi of GEAR) back.gear[gi.id] = num(back.gear[gi.id]);
+  for (const k in back.ranks) back.ranks[k] = num(back.ranks[k]);
+  for (const k in back.cleared) back.cleared[k] = num(back.cleared[k]);
+  for (const m of MARKET) back.market[m.id] = num(back.market[m.id], 1);
+  for (const k of ["time", "totalXP", "legacy", "careerFunding", "allTimeFunding", "traded", "patrols", "stakeoutAt", "runs"])
+    back[k] = num(back[k]);
+  back.crew.n = Math.max(0, Math.floor(num(back.crew.n)));
+  back.crew.grow = num(back.crew.grow);
+  back.crew.unpaid = num(back.crew.unpaid);
+  for (const j of JOBS) back.crew.jobs[j.id] = num(back.crew.jobs[j.id]);
+  back.streak = { days: num(back.streak.days), last: num(back.streak.last) };
   return back;
 }
 
@@ -606,10 +627,15 @@ function derive(s, opts = {}) {
   }
   const upkeep = split.n > 0 ? TUNE.crewUpkeep * (Math.pow(TUNE.crewUpkeepStep, split.n) - 1) / (TUNE.crewUpkeepStep - 1) : 0;
 
+  /* building output reads straight off the content table, so tuning a
+     rate in TERRITORY is the whole change */
+  const makes = { leads: 0, salvage: 0, funding: 0 };
+  for (const t of TERRITORY)
+    if (t.makes && t.rate) makes[t.makes] += (s.own[t.id] || 0) * t.rate * bMult[t.id];
   const gross = {
-    leads: (s.own.perch * 0.5 * bMult.perch + s.own.informants * 4 * bMult.informants + crewMakes.leads) * mult.leads * (mods.leads || 1) * global,
-    salvage: (s.own.yard * 0.45 * bMult.yard + crewMakes.salvage) * mult.salvage * (mods.salvage || 1) * global,
-    funding: (s.own.watch * 0.35 * bMult.watch + s.own.precinct * 3.5 * bMult.precinct + crewMakes.funding) * mult.funding * (mods.funding || 1) * global,
+    leads: (makes.leads + crewMakes.leads) * mult.leads * (mods.leads || 1) * global,
+    salvage: (makes.salvage + crewMakes.salvage) * mult.salvage * (mods.salvage || 1) * global,
+    funding: (makes.funding + crewMakes.funding) * mult.funding * (mods.funding || 1) * global,
     xp: 0,
   };
 
@@ -666,14 +692,12 @@ function derive(s, opts = {}) {
   /* What auto-fire adds on average, for the readouts. The survival test
      stays on raw stats: bursts are lumpy and a fight shorter than a
      cooldown can't count on one. */
-  let burst = 0, cover = 0;
+  let burst = 0;
   for (const a of abilities) {
     if (a.kind === "hit") burst += a.amount / a.cd;
     else if (a.kind === "boost") burst += power * (a.mag - 1) * a.dur / a.cd;
-    else if (a.kind === "guard") cover += a.mag * a.dur / a.cd;
   }
   const sustain = auto ? power + burst : power;
-  const intake = auto ? 1 - Math.min(0.9, cover) : 1;
 
   const dist = distById(s.district);
   const ttk = power > 0 ? dist.hp / power : Infinity;
@@ -692,7 +716,7 @@ function derive(s, opts = {}) {
     caps, capMult, price, proj, projCd, projDone, badges, badgeMult, boon, streakDays, streakMult,
     crew: split, beds, crewMult, crewMakes, crewCombat, crewXP, upkeep,
     patrol, power, resolve, xpMult, fightMult, dist, ttk, ttkEff, damageTaken, winnable, xpRate,
-    abilities, auto, cdMult, abilMult, sustain, intake,
+    abilities, auto, cdMult, abilMult, sustain,
     ko: (tech.medicine ? TUNE.koFast : TUNE.koSeconds) * cdMult,
     healthLeft: Math.max(0, 1 - damageTaken / resolve),
     xpInto: s.totalXP - floorXP,
@@ -750,11 +774,14 @@ function maxAffordable(item, own, res, discount) {
   return n;
 }
 
-/* When auto-fire is on, would this ability be worth using right now? */
+/* When auto-fire is on, would this ability be worth using right now?
+   A heal fires once at least half of it would land: demanding the whole
+   heal fit made it unfireable once Training Floors pushed the heal to
+   full resolve, which starved exactly the players who invested most. */
 function wants(a, f, d) {
   if (a.kind === "hit") return f.enemyHP > 0;
   if (a.kind === "guard" || a.kind === "boost") return !(f.buff[a.id] > 0);
-  if (a.kind === "heal") return f.heroHP <= d.resolve - a.amount + 1e-9;
+  if (a.kind === "heal") return f.heroHP <= d.resolve - Math.min(a.amount, d.resolve) * 0.5 + 1e-9;
   return false;
 }
 
@@ -841,6 +868,21 @@ function combatStep(s, dt, d) {
       if (isBoss) { isBoss = false; for (const k in buff) delete buff[k]; }
     }
   }
+  /* A huge catch-up in a district that dies in milliseconds can exhaust
+     the loop budget with time still on the clock. Settle the remainder
+     statistically at the same rate the readouts advertise — throwing the
+     hours away punished exactly the players farming fast kills. */
+  if (t > 1e-9 && !isBoss && d.winnable && d.ttkEff > 0 && Number.isFinite(d.ttkEff)) {
+    const n = Math.floor(t / d.ttkEff);
+    if (n > 0) {
+      kills += n;
+      xp += n * dist.xp * d.xpMult;
+      tick(t);
+      t = 0;
+      enemyHP = foeHP();
+      heroHP = d.resolve;
+    }
+  }
   return { fight: { ...f, enemyHP, heroHP, ko, boss: isBoss, cd, buff, cast: [] }, xp, kills, bossWin, heroAtWin };
 }
 
@@ -905,6 +947,19 @@ function pour(res, caps, k, n, spill) {
 
 const logged = (list, t, text) => [...list, { t: Math.floor(t), text }].slice(-TUNE.logKeep);
 
+/* What a windfall is worth: a share of the ceiling or seconds of income,
+   whichever is more, so it matters both early and at a full lockup. Every
+   payout that is allowed over the ceiling prices itself through here. */
+const windfall = (d, res, capShare, seconds) => Math.max(d.caps[res] * capShare, d.gross[res] * seconds);
+
+/* A new boon never downgrades a live one: a stronger boon takes over,
+   and a weaker one converts into time on the stronger clock at equal
+   value (×1.5 for 600s arriving during a ×2 is 300 more seconds of ×2). */
+const mergeBoon = (cur, neu) =>
+  !cur || !(cur.left > 0) ? neu
+  : neu.mult > cur.mult ? neu
+  : { ...cur, left: cur.left + (neu.left * (neu.mult - 1)) / (cur.mult - 1) };
+
 /* ------------------------- the bounty board ------------------------ */
 
 /* Rounds a goal to something a person can hold in their head. */
@@ -939,62 +994,83 @@ function rollContracts(s, d, day) {
       id: c.id,
       base: METRICS[c.metric](s),
       goal: c.goal(s, d),
-      pay: { [c.pay]: Math.ceil(Math.max(100, d.caps[c.pay] * TUNE.contractCap, d.gross[c.pay] * TUNE.contractPay)) },
+      pay: { [c.pay]: Math.ceil(Math.max(100, windfall(d, c.pay, TUNE.contractCap, TUNE.contractPay))) },
       done: false,
     })),
   };
 }
 
-/* One pass over the board: lapse a cold streak, roll at midnight, pay out
-   anything filled. Pure, and driven by the wall clock — the UI calls it
-   once a second with today's number, so `step` stays clock-free and the
-   scripts can drive it with any day they like. Returns null when nothing
-   changed. */
-function contractTick(s, day) {
-  let next = null;
-  const bump = () => next || (next = { ...s });
-  /* a skipped day puts the streak back to zero, wherever you are */
-  if (s.streak && s.streak.days > 0 && day - s.streak.last > 1) {
-    bump().streak = { days: 0, last: 0 };
-    next.log = logged(next.log, s.time, "The streak lapsed. The board doesn't hold grudges; start again.");
-  }
-  /* the board itself only exists once the city has seen you finish a boss */
-  if (!s.hero || !s.bosses.flats) return next;
-  const cs = next || s;
-  if (!cs.contracts || cs.contracts.day !== day || !Array.isArray(cs.contracts.list)) {
-    bump().contracts = rollContracts(cs, derive(cs), day);
-    if (s.contracts) next.log = logged(next.log, s.time, "The board turned over. Three new bounties are up.");
-    return next;
-  }
+/* Pays out anything filled on `board`, crediting the streak for the day
+   the board was posted — a goal crossed just before midnight (or while
+   away) still pays, and still counts for its own day. Returns null when
+   nothing filled. */
+function settleBoard(cs, board) {
   const doneNow = [];
-  const list = cs.contracts.list.map((c) => {
+  const list = board.list.map((c) => {
     if (c.done) return c;
     const t = contractById(c.id);
     if (!t || METRICS[t.metric](cs) - c.base + 1e-9 < c.goal) return c;
     doneNow.push(c);
     return { ...c, done: true };
   });
-  if (!doneNow.length) return next;
-  bump();
-  next.contracts = { ...cs.contracts, list };
-  next.res = { ...cs.res };
+  if (!doneNow.length) return null;
+  const next = { ...cs, contracts: { ...board, list }, res: { ...cs.res } };
   for (const c of doneNow) {
     for (const k in c.pay) next.res[k] += c.pay[k];
-    next.log = logged(next.log, s.time,
+    next.log = logged(next.log, cs.time,
       `Bounty filled: ${contractById(c.id).name}. ${Object.keys(c.pay).map((k) => `+${amt(c.pay[k])} ${nameOf(k).toLowerCase()}`).join(", ")}.`);
   }
-  if (((cs.streak || {}).last || 0) !== day) {
-    const days = ((cs.streak || {}).last || 0) === day - 1 ? (cs.streak.days || 0) + 1 : 1;
-    next.streak = { days, last: day };
-    next.log = logged(next.log, s.time,
+  const st = cs.streak || { days: 0, last: 0 };
+  if ((st.last || 0) !== board.day) {
+    const days = (st.last || 0) === board.day - 1 ? (st.days || 0) + 1 : 1;
+    next.streak = { days, last: board.day };
+    next.log = logged(next.log, cs.time,
       `Day ${days} on the board. +${pct(TUNE.streakBonus * Math.min(TUNE.streakCap, days))} region while the streak holds.`);
   }
   if (list.every((c) => c.done)) {
-    next.boon = { id: "board", mult: 1.5, left: 600 };
-    next.log = logged(next.log, s.time, "The board is clear. Word travels: ×1.5 region for ten minutes.");
+    next.boon = mergeBoon(cs.boon, { id: "board", mult: 1.5, left: 600 });
+    next.log = logged(next.log, cs.time, `The board is clear. Word travels: ×${next.boon.mult} region for ${Math.round(next.boon.left)}s.`);
   }
   return next;
 }
+
+/* One pass over the board: settle yesterday's board before rolling it
+   over, lapse a cold streak, roll at midnight, pay out anything filled.
+   Pure, and driven by the wall clock — the UI calls it once a second with
+   today's number, so `step` stays clock-free and the scripts can drive it
+   with any day they like. Returns null when nothing changed. */
+function contractTick(s, day) {
+  if (!s.hero) return null;
+  let cs = s;
+  /* a board from an earlier day settles before it turns over: a bounty
+     crossed late, or while away, is not lost to midnight. A board dated
+     LATER than today (the clock moved back — travel, DST) is not stale:
+     it keeps running, so a backward day can never roll a second slate. */
+  const stale = cs.contracts && Array.isArray(cs.contracts.list) && day > cs.contracts.day ? cs.contracts : null;
+  if (stale) cs = settleBoard(cs, stale) || cs;
+  /* a skipped day puts the streak back to zero, wherever you are */
+  if (cs.streak && cs.streak.days > 0 && day - cs.streak.last > 1) {
+    cs = { ...cs, streak: { days: 0, last: 0 }, log: logged(cs.log, cs.time, "The streak lapsed. The board doesn't hold grudges; start again.") };
+  }
+  /* the board itself only exists once the city has seen you finish a boss */
+  if (cs.bosses.flats) {
+    if (!cs.contracts || !Array.isArray(cs.contracts.list) || day > cs.contracts.day) {
+      /* goals are a day's promise: never let a passing boon inflate them */
+      cs = { ...cs, contracts: rollContracts(cs, derive({ ...cs, boon: null }), day) };
+      if (s.contracts) {
+        const n = cs.contracts.list.length;
+        cs.log = logged(cs.log, cs.time, `The board turned over. ${n === 3 ? "Three" : n === 2 ? "Two" : n === 1 ? "One" : n} new ${n === 1 ? "bounty is" : "bounties are"} up.`);
+      }
+    } else {
+      cs = settleBoard(cs, cs.contracts) || cs;
+    }
+  }
+  return cs === s ? null : cs;
+}
+
+/* Local-midnight day number. Only the UI and the prestige handler call
+   this; the engine takes `day` as an argument and stays clock-free. */
+const dayNow = () => Math.floor((Date.now() - new Date().getTimezoneOffset() * 60000) / 86400000);
 
 function step(s, dt, opts = {}) {
   const d = derive(s, opts);
@@ -1128,10 +1204,10 @@ function step(s, dt, opts = {}) {
   if (dt <= 5 && !opts.quiet && Math.random() < dt / TUNE.eventEvery) {
     const e = EVENTS[Math.floor(Math.random() * EVENTS.length)];
     if (e.boon) {
-      next.boon = { id: e.id, mult: e.boon.mult, left: e.boon.dur };
-      note.push(`${e.text} ×${e.boon.mult} region for ${Math.round(e.boon.dur)}s.`);
+      next.boon = mergeBoon(next.boon, { id: e.id, mult: e.boon.mult, left: e.boon.dur });
+      note.push(`${e.text} ×${next.boon.mult} region for ${Math.round(next.boon.left)}s.`);
     } else {
-      const gain = Math.max(caps[e.res] * 0.06, d.gross[e.res] * e.secs);
+      const gain = windfall(d, e.res, 0.06, e.secs);
       next.res = { ...next.res, [e.res]: next.res[e.res] + gain };
       note.push(`${e.text} +${amt(gain)} ${nameOf(e.res).toLowerCase()}.`);
     }
@@ -1151,6 +1227,19 @@ function step(s, dt, opts = {}) {
 
   if (note.length) next.log = note.reduce((l, text) => logged(l, next.time, text), s.log || []);
   return next;
+}
+
+/* Replays `gap` real seconds under the offline rules — capped, at the
+   offline rate, in quiet slices. The load-time catch-up and a throttled
+   or suspended tab both come through here, so there is one policy. */
+function catchUp(s0, gap) {
+  const cap = s0.tech.archive ? TUNE.offlineCapLong : TUNE.offlineCap;
+  const eff = s0.tech.contingency ? 1 : TUNE.offlineRate;
+  const t = Math.min(gap, cap) * eff;
+  const slices = Math.max(1, Math.min(240, Math.ceil(t / 60)));
+  let b = s0;
+  for (let i = 0; i < slices; i++) b = step(b, t / slices, { quiet: true });
+  return b;
 }
 
 /* ---------------------------- display ---------------------------- */
@@ -1195,7 +1284,7 @@ export const engine = {
   freshState, migrate, derive, step, costOf, powerCost, canPay, maxAffordable,
   unlocked, bossReady, forecastBoss, startBoss, bestDistrict, levelOf,
   crewSplit, projectCost, projectMax, projectAt, marketDip,
-  rollContracts, contractTick,
+  rollContracts, contractTick, settleBoard, windfall, mergeBoon, catchUp,
 };
 
 /* ============================ THE HOOK ============================ */
@@ -1218,23 +1307,29 @@ function useGame() {
   useEffect(() => {
     let dead = false;
     (async () => {
+      let raw = null;
       try {
-        const hit = await window.storage.get(TUNE.saveKey);
-        const saved = JSON.parse(hit.value);
-        let back = migrate(saved.state);
-        const cap = back.tech.archive ? TUNE.offlineCapLong : TUNE.offlineCap;
-        const eff = back.tech.contingency ? 1 : TUNE.offlineRate;
-        const gap = Math.min(cap, (Date.now() - saved.at) / 1000);
-        if (back.hero && gap > 60) {
-          const before = { funding: back.res.funding, xp: back.totalXP };
-          const slice = (gap * eff) / 240;
-          /* quiet: events and flashpoints are for live play, whatever the slice size */
-          for (let i = 0; i < 240; i++) back = step(back, slice, { quiet: true });
-          if (!dead) setAway({ gap, funding: back.res.funding - before.funding, xp: back.totalXP - before.xp });
-        }
-        if (!dead) setS(back);
+        raw = (await window.storage.get(TUNE.saveKey)).value;
       } catch {
         /* nothing saved, or storage unavailable */
+      }
+      if (raw != null) {
+        try {
+          const saved = JSON.parse(raw);
+          let back = migrate(saved.state);
+          const gap = (Date.now() - saved.at) / 1000;
+          if (back.hero && gap > 60) {
+            const before = { funding: back.res.funding, xp: back.totalXP };
+            const shown = Math.min(gap, back.tech.archive ? TUNE.offlineCapLong : TUNE.offlineCap);
+            back = catchUp(back, gap);
+            if (!dead) setAway({ gap: shown, funding: back.res.funding - before.funding, xp: back.totalXP - before.xp });
+          }
+          if (!dead) setS(back);
+        } catch {
+          /* A save that exists but won't load must never be overwritten by
+             the autosave ten seconds later: park it under a rescue key. */
+          try { await window.storage.set(TUNE.saveKey + ":rescue", raw); } catch { /* storage unavailable */ }
+        }
       }
       if (!dead) setReady(true);
     })();
@@ -1246,9 +1341,22 @@ function useGame() {
     let last = Date.now();
     const id = setInterval(() => {
       const now = Date.now();
-      const dt = Math.min(1, (now - last) / 1000);
+      const gap = (now - last) / 1000;
       last = now;
-      setS((p) => (p.hero ? step(p, dt) : p));
+      setS((p) => {
+        if (!p.hero) return p;
+        /* a hidden tab still ticks, but quietly: events and flashpoints
+           are for someone who can actually see them */
+        const hidden = typeof document !== "undefined" && document.visibilityState === "hidden";
+        if (gap <= 5) {
+          /* jank up to 5s is simulated in full, one second at a time */
+          let b = p;
+          for (let rem = gap; rem > 1e-9; rem -= 1) b = step(b, Math.min(1, rem), hidden ? { quiet: true } : {});
+          return b;
+        }
+        /* the tab was throttled or the machine slept: same policy as load */
+        return catchUp(p, gap);
+      });
     }, 100);
     return () => clearInterval(id);
   }, [ready]);
@@ -1278,7 +1386,6 @@ function useGame() {
      local midnight, pays out what you've filled, and lapses cold streaks. */
   useEffect(() => {
     if (!ready) return;
-    const dayNow = () => Math.floor((Date.now() - new Date().getTimezoneOffset() * 60000) / 86400000);
     const tick = () => setS((p) => contractTick(p, dayNow()) || p);
     tick();
     const id = setInterval(tick, 1000);
@@ -1452,7 +1559,7 @@ function useGame() {
     if (t.id === "safehouse") return `${t.blurb} Each one cuts ability recharge and knockout time by another ${pct(TUNE.safehouseEach)} of the base. ${own} of them have recharge at ${x(1 / (1 + TUNE.safehouseEach * own))}.`;
     if (t.id === "gym") return `${t.blurb} Each one adds ${pct(TUNE.gymEach)} to what every ability does: Haymaker damage, Second Wind healing, and how long Brace and Surge last. ${own} of them have abilities at ${x(d.abilMult)}.`;
     if (!t.makes) return `${t.blurb} You hold ${own}.`;
-    const each = (t.id === "informants" ? 4 : t.rate) * d.bMult[t.id] * d.mult[t.makes] * ((d.hero?.mods || {})[t.makes] || 1) * d.global;
+    const each = t.rate * d.bMult[t.id] * d.mult[t.makes] * ((d.hero?.mods || {})[t.makes] || 1) * d.global;
     return `${t.blurb} You hold ${own}, at ${rate(each * own)} ${nameOf(t.makes).toLowerCase()} a second. Tech has these at ${x(d.bMult[t.id])} and your powers at ${x(d.mult[t.makes])}. Each costs ${pct(t.growth - 1)} more than the last.`;
   };
 
@@ -1543,26 +1650,27 @@ function useGame() {
 
   const stakeTip = () =>
     `A timing game. Start the stakeout, watch the marker sweep, and move in when it crosses the drop. ` +
-    `Inside the window pays about ${amt(Math.max(d.caps.leads * TUNE.stakeoutCap, d.gross.leads * TUNE.stakeoutRes))} leads and ${amt(Math.max(d.caps.funding * TUNE.stakeoutCap, d.gross.funding * TUNE.stakeoutRes))} funding; dead centre pays triple. ` +
-    `Blow it and nothing but the wait. Another handoff every ${TUNE.stakeoutCd}s, sooner after a miss.`;
+    `Inside the window pays about ${amt(windfall(d, "leads", TUNE.stakeoutCap, TUNE.stakeoutRes))} leads and ${amt(windfall(d, "funding", TUNE.stakeoutCap, TUNE.stakeoutRes))} funding; dead centre pays triple. ` +
+    `Blow it and nothing but the wait. Another handoff every ${TUNE.stakeoutCd}s, sooner after a miss — and starting one commits you: walking away counts as a miss.`;
 
   /* ---- actions ---- */
   const choose = (id) => setS((p) => ({ ...p, hero: id }));
   const setDistrict = (id) => setS((p) => (p.district === id ? p : { ...p, district: id, fight: freshFight() }));
 
   /* Chained taps build momentum: +5% a tap up to ×2.5, dropped the moment
-     you stop for a breath. Autopilot patrols never touch it. */
+     you stop for a breath. Autopilot patrols never touch it. Patrols are
+     income, not windfalls, so they stop at the ceiling like everything
+     else you produce. */
   const patrol = () =>
     setS((p) => {
+      const dd = derive(p);
       const m = p.momentum || { n: 0, at: -10 };
       const n = p.time - m.at <= TUNE.momentumWindow ? Math.min(m.n + 1, TUNE.momentumCap) : 0;
-      const gain = derive(p).patrol * (1 + TUNE.momentumStep * n);
-      return {
-        ...p,
-        patrols: (p.patrols || 0) + 1,
-        momentum: { n, at: p.time },
-        res: { ...p.res, leads: p.res.leads + gain, salvage: p.res.salvage + gain },
-      };
+      const gain = dd.patrol * (1 + TUNE.momentumStep * n);
+      const res = { ...p.res };
+      pour(res, dd.caps, "leads", gain, null);
+      pour(res, dd.caps, "salvage", gain, null);
+      return { ...p, patrols: (p.patrols || 0) + 1, momentum: { n, at: p.time }, res };
     });
 
   /* Answering a flashpoint before the clock runs out. The windfall is
@@ -1572,29 +1680,39 @@ function useGame() {
       if (!p.flash) return p;
       const fp = FLASHPOINTS.find((f) => f.id === p.flash.id);
       if (!fp) return { ...p, flash: null };
-      if (fp.boon)
-        return { ...p, flash: null, boon: { id: fp.id, mult: fp.boon.mult, left: fp.boon.dur },
-          log: logged(p.log, p.time, `${fp.won} ×${fp.boon.mult} region for ${fp.boon.dur}s.`) };
+      if (fp.boon) {
+        const boon = mergeBoon(p.boon, { id: fp.id, mult: fp.boon.mult, left: fp.boon.dur });
+        return { ...p, flash: null, boon,
+          log: logged(p.log, p.time, `${fp.won} ×${boon.mult} region for ${Math.round(boon.left)}s.`) };
+      }
       const dd = derive(p);
-      const gain = Math.max(dd.caps[fp.res] * TUNE.flashCap, dd.gross[fp.res] * TUNE.flashRes);
+      const gain = windfall(dd, fp.res, TUNE.flashCap, TUNE.flashRes);
       return { ...p, flash: null, res: { ...p.res, [fp.res]: p.res[fp.res] + gain },
         log: logged(p.log, p.time, `${fp.won} +${amt(gain)} ${nameOf(fp.res).toLowerCase()}.`) };
     });
 
-  /* The stakeout resolves in the UI (it's a timing game); this is only the
-     payout. Perfect pays triple, a miss pays nothing and comes back sooner. */
+  /* Starting a stakeout arms it and charges the short cooldown up front,
+     so walking away from the sweep (closing the tab, changing tabs) is
+     exactly a miss and never a free retry. Resolving a hit upgrades it. */
+  const stakeStart = () =>
+    setS((p) => (p.time < (p.stakeoutAt || 0) ? p : { ...p, stakeArm: true, stakeoutAt: p.time + TUNE.stakeoutMissCd }));
+
+  /* The stakeout resolves in the UI (it's a timing game); this is only
+     the payout. The armed flag makes it pay once per start, however many
+     times a race or replayed click calls it. Perfect pays triple, a miss
+     keeps the short cooldown already charged at the start. */
   const stakeout = (quality) =>
     setS((p) => {
-      if (p.time < (p.stakeoutAt || 0)) return p;
+      if (!p.stakeArm) return p;
       if (quality === "miss")
-        return { ...p, stakeoutAt: p.time + TUNE.stakeoutMissCd,
-          log: logged(p.log, p.time, "Stakeout blown: a bottle rolls off a dumpster and everyone scatters.") };
+        return { ...p, stakeArm: false, log: logged(p.log, p.time, "Stakeout blown: a bottle rolls off a dumpster and everyone scatters.") };
       const dd = derive(p);
       const mult = quality === "perfect" ? 3 : 1;
-      const leads = Math.max(dd.caps.leads * TUNE.stakeoutCap, dd.gross.leads * TUNE.stakeoutRes) * mult;
-      const funding = Math.max(dd.caps.funding * TUNE.stakeoutCap, dd.gross.funding * TUNE.stakeoutRes) * mult;
+      const leads = windfall(dd, "leads", TUNE.stakeoutCap, TUNE.stakeoutRes) * mult;
+      const funding = windfall(dd, "funding", TUNE.stakeoutCap, TUNE.stakeoutRes) * mult;
       return {
         ...p,
+        stakeArm: false,
         stakeoutAt: p.time + TUNE.stakeoutCd,
         res: { ...p.res, leads: p.res.leads + leads, funding: p.res.funding + funding },
         log: logged(p.log, p.time, quality === "perfect"
@@ -1681,13 +1799,15 @@ function useGame() {
   const clearCrew = () => setS((p) => ({ ...p, crew: { ...p.crew, jobs: freshCrew().jobs } }));
 
   /* ---- market ---- */
+  /* A sale is a windfall: the proceeds are allowed over the funding
+     ceiling, exactly as the storage tooltips promise. Clamping it to the
+     cap made the documented escape valve for a full lockup a no-op. */
   const sell = (id, share) =>
     setS((p) => {
       const dd = derive(p);
       const price = dd.price[id];
-      const room = Math.max(0, dd.caps.funding - p.res.funding);
-      const qty = Math.min(p.res[id] * share, price > 0 ? room / price : 0);
-      if (!(qty > 0.5)) return p;
+      const qty = p.res[id] * share;
+      if (!(qty > 0.5) || !(price > 0)) return p;
       const paid = qty * price;
       return {
         ...p,
@@ -1721,7 +1841,9 @@ function useGame() {
       const dd = derive(p);
       const at = projectAt(p, pr);
       const want = share === "max" ? projectMax(p, pr, dd.cut.tech) : Math.min(share, 1 - at.prog);
-      if (!(want > 1e-4)) return p;
+      /* the guard is looser than the completion epsilon (1e-6), so a
+         project can never strand a sliver too small to ever pay for */
+      if (!(want > 1e-9)) return p;
       const cost = projectCost(pr, at.done, want, dd.cut.tech);
       if (!canPay(cost, p.res)) return p;
       const res = { ...p.res };
@@ -1755,6 +1877,12 @@ function useGame() {
       traded: p.traded,
       runs: (p.runs || 0) + 1,
       streak: p.streak,
+      /* keep today's filled bounties so the board can't roll a second,
+         double-paying slate on the same day; a board with nothing filled
+         has paid nothing, so the new career gets a fresh one */
+      contracts: p.contracts && Array.isArray(p.contracts.list) && p.contracts.list.some((c) => c.done)
+        ? { day: p.contracts.day, list: p.contracts.list.filter((c) => c.done) }
+        : null,
       log: logged(p.log, 0, `The cowl changes hands. +${gain} legacy carried into the next one.`),
     }));
     setArmed(null);
@@ -1786,7 +1914,7 @@ function useGame() {
     : t.id === "safehouse" ? `recharge ${x(1 / (1 + TUNE.safehouseEach * (s.own.safehouse || 0)))} · −${pct(TUNE.safehouseEach)} each`
     : t.id === "gym" ? `abilities ${x(d.abilMult)} · +${pct(TUNE.gymEach)} each`
     : !t.makes ? "held"
-    : `${rate((t.id === "informants" ? 4 : t.rate) * d.bMult[t.id] * d.mult[t.makes] * ((d.hero?.mods || {})[t.makes] || 1) * d.global)} ${nameOf(t.makes).toLowerCase()}/s each`;
+    : `${rate(t.rate * d.bMult[t.id] * d.mult[t.makes] * ((d.hero?.mods || {})[t.makes] || 1) * d.global)} ${nameOf(t.makes).toLowerCase()}/s each`;
 
   const gearLine = (gi) =>
     gi.stat === "power" ? `+${rate(gi.per * d.mult.power * d.fightMult)} power each`
@@ -1837,7 +1965,7 @@ function useGame() {
     resTip, levelTip, heroTip, fightTip, distTip, bossTip, abilityTip, abilitiesTip, gearTip, terrTip, powerTip,
     techTip, techEffect, queueTip, legacyTip, etaLabel, storageTip, crewTip, jobTip, marketTip, projectTip, achieveTip,
     boardTip, streakTip, stakeTip,
-    choose, setDistrict, patrol, respond, stakeout, cast, challenge, retreat, claim, equip, train, research, handOver, wipe,
+    choose, setDistrict, patrol, respond, stakeStart, stakeout, cast, challenge, retreat, claim, equip, train, research, handOver, wipe,
     assign, spreadCrew, clearCrew, sell, acquire, toggleSell, fund,
     projectPrice: (pr, share) => projectCost(pr, projectAt(s, pr).done, share, d.cut.tech),
     projectAt: (pr) => projectAt(s, pr),
@@ -2290,7 +2418,7 @@ function Works({ g }) {
                     <button
                       key={label}
                       className="n-mode"
-                      disabled={share === "max" ? !(max > 1e-4) : !canPay(g.projectPrice(pr, Math.min(share, 1 - at.prog)), s.res)}
+                      disabled={share === "max" ? !(max > 1e-9) : !canPay(g.projectPrice(pr, Math.min(share, 1 - at.prog)), s.res)}
                       onClick={() => g.fund(pr, share)}
                     >
                       {label}
@@ -2313,12 +2441,15 @@ function Works({ g }) {
 function Stakeout({ g }) {
   const { s, d } = g;
   const wait = Math.max(0, (s.stakeoutAt || 0) - s.time);
-  const ready = wait <= 0;
   const [run, setRun] = useState(null); /* { t0, zone } — zone is the drop's centre, 0..1 */
-  const [pos, setPos] = useState(0);
+  const ready = wait <= 0 && !run;
   const posRef = useRef(0);
+  const markRef = useRef(null);
   const [word, setWord] = useState(null);
 
+  /* The sweep writes the marker through a ref: 60fps on a 3px marker is
+     not worth 60 renders a second. Starting charged the short cooldown
+     already, so letting the run rot (or leaving) is exactly a miss. */
   useEffect(() => {
     if (!run) return;
     let id;
@@ -2328,7 +2459,7 @@ function Stakeout({ g }) {
       const p2 = (t % 1.8) / 0.9;
       const p = p2 < 1 ? p2 : 2 - p2;
       posRef.current = p;
-      setPos(p);
+      if (markRef.current) markRef.current.style.left = pct(p);
       id = requestAnimationFrame(loop);
     };
     id = requestAnimationFrame(loop);
@@ -2338,6 +2469,7 @@ function Stakeout({ g }) {
   const start = () => {
     if (!ready) return;
     setWord(null);
+    g.stakeStart();
     setRun({ t0: performance.now(), zone: 0.22 + Math.random() * 0.56 });
   };
   const moveIn = () => {
@@ -2354,7 +2486,7 @@ function Stakeout({ g }) {
       <div className="n-item-top">
         <span className="n-name">The Handoff</span>
         <span className="n-top-right">
-          {!ready && <span className="n-count">{secs(wait)}</span>}
+          {!ready && !run && <span className="n-count">{secs(wait)}</span>}
           <button className="n-info" {...g.tipProps("stake", "Stakeout", g.stakeTip())}>?</button>
         </span>
       </div>
@@ -2363,7 +2495,7 @@ function Stakeout({ g }) {
           <div className="n-stake-bar">
             <span className="n-stake-zone" style={{ left: pct(run.zone - 0.09), width: pct(0.18) }} />
             <span className="n-stake-perfect" style={{ left: pct(run.zone - 0.03), width: pct(0.06) }} />
-            <span className="n-stake-mark" style={{ left: pct(pos) }} />
+            <span className="n-stake-mark" ref={markRef} style={{ left: 0 }} />
           </div>
           <div className="n-item-bot">
             <span className="n-sub">the drop is marked · dead centre pays ×3</span>
@@ -2373,7 +2505,7 @@ function Stakeout({ g }) {
       ) : (
         <div className="n-item-bot">
           <span className="n-sub">
-            {word || `Word is a handoff is going down nearby. Worth about ${amt(Math.max(d.caps.leads * TUNE.stakeoutCap, d.gross.leads * TUNE.stakeoutRes))} leads and ${amt(Math.max(d.caps.funding * TUNE.stakeoutCap, d.gross.funding * TUNE.stakeoutRes))} funding.`}
+            {word || `Word is a handoff is going down nearby. Worth about ${amt(windfall(d, "leads", TUNE.stakeoutCap, TUNE.stakeoutRes))} leads and ${amt(windfall(d, "funding", TUNE.stakeoutCap, TUNE.stakeoutRes))} funding.`}
           </span>
           <button className="n-mode n-stake-go" disabled={!ready} onClick={start}>
             {ready ? "Start the stakeout" : `next in ${secs(wait)}`}
@@ -2391,12 +2523,12 @@ function Bounties({ g }) {
   const list = (s.contracts && s.contracts.list) || [];
   return (
     <>
-      <Section label="Bounty Board" sub="three a day · the board turns over at midnight" g={g} />
+      <Section label="Bounty Board" sub="up to three a day · the board turns over at midnight" g={g} />
       <Slab
         flat
         label="Day Streak"
-        count={d.streakDays || (s.streak || {}).days || 0}
-        countLabel={d.streakDays ? `day ${(s.streak || {}).days}` : "cold"}
+        count={1}
+        countLabel={(s.streak || {}).days > 0 ? `day ${s.streak.days}` : "cold"}
         sub={
           d.streakDays
             ? `+${pct(TUNE.streakBonus * d.streakDays)} region while it holds · fill any bounty each day to keep it`
