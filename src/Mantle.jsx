@@ -5,17 +5,27 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
  *
  *    REGION   buildings produce leads, salvage and funding. Two of
  *             them, opened by bosses, feed the fight instead
+ *    STORAGE  every resource but XP has a ceiling, and lockups raise
+ *             it. Income stops there; windfalls are allowed over it
+ *    CREW     safehouses are beds and beds are why people stay. Five
+ *             jobs, a payroll out of funding, and hands who leave if
+ *             it goes unpaid
+ *    MARKET   leads and salvage move for funding. Dumping sags the
+ *             price, time walks it back, buying costs the spread
  *    FIGHT    an auto battler with four abilities on cooldowns and a
  *             boss at the end of every district. Gear sets your base
  *             stats, powers multiply them, abilities spend them well.
  *             Fights are the only source of XP
  *    POWERS   ranks bought with XP, multiplying region and combat
+ *    WORKS    city projects paid for in slices, stacking forever
+ *    RECORD   achievements, kept when the cowl changes hands
  *    TECH     a four-branch tree. Street makes the region richer and
  *             cheaper, Body opens the abilities and amplifies the
  *             fight, Mind amplifies the region's powers, and Ops
  *             unlocks the quality-of-life the game withholds at the
  *             start: bulk buying, the build queue, auto-patrol,
- *             auto-fire, auto-climb and longer offline time
+ *             auto-fire, auto-climb, overflow selling and longer
+ *             offline time
  * ------------------------------------------------------------------ */
 
 /* ============================ CONTENT ============================= */
@@ -113,6 +123,7 @@ const GEAR = [
 
 const TERRITORY = [
   { id: "perch", name: "Rooftop Perch", makes: "leads", rate: 0.5, base: { salvage: 12 }, growth: 1.15, show: () => true, blurb: "A clear sightline over four blocks." },
+  { id: "lockup", name: "Lockup", makes: null, base: { salvage: 35, leads: 20 }, growth: 1.13, show: () => true, blurb: "Somewhere to put it all that nobody else has a key to." },
   { id: "yard", name: "Scrap Yard", makes: "salvage", rate: 0.45, base: { leads: 18 }, growth: 1.15, show: (s) => s.own.perch >= 1, blurb: "Wreckage comes to you instead of the other way round." },
   { id: "watch", name: "Block Watch", makes: "funding", rate: 0.35, base: { leads: 40, salvage: 70 }, growth: 1.15, show: (s) => s.own.yard >= 2, blurb: "The neighbourhood decides to chip in." },
   { id: "safehouse", name: "Safehouse", makes: null, base: { salvage: 150, leads: 100 }, growth: 1.2, show: (s) => !!s.bosses.flats, blurb: "Somewhere to get taped up and go back out." },
@@ -122,10 +133,84 @@ const TERRITORY = [
   { id: "tower", name: "Signal Tower", makes: null, base: { funding: 30000, salvage: 10000, leads: 7000 }, growth: 1.22, show: (s) => !!s.tech.uplink, blurb: "Each tower lifts everything you hold." },
 ];
 
+/* ---------------------------- the crew ---------------------------- *
+ *  Safehouses are beds; beds are the only reason anyone stays. Crew
+ *  arrive on their own while there is room and the funding to pay
+ *  them, and you decide what they do. Three jobs feed the region, two
+ *  feed the fight. Idle crew do nothing but still eat.
+ * ------------------------------------------------------------------ */
+const JOBS = [
+  { id: "beat", name: "Street Beat", makes: { leads: 0.8, salvage: 0.8 }, blurb: "Four blocks each, on foot, all night." },
+  { id: "scavenge", name: "Scavenging", makes: { salvage: 2.4 }, blurb: "They strip a crash site down to the bolts." },
+  { id: "outreach", name: "Outreach", makes: { funding: 1.8 }, blurb: "Someone has to shake the tin and smile." },
+  { id: "sparring", name: "Sparring", combat: 0.04, blurb: "You hit harder when someone hits back all week." },
+  { id: "intel", name: "Intel Desk", xp: 0.035, blurb: "They know who you fought before you do." },
+];
+
+/* ------------------------- city projects -------------------------- *
+ *  Huge, part-payable works. Buy any slice of the next one, keep the
+ *  progress, and every completion stacks forever. The city's answer to
+ *  a wall of funding with nothing left to spend it on.
+ * ------------------------------------------------------------------ */
+const PROJECTS = [
+  { id: "beacon", name: "The Beacon", base: { funding: 45000, salvage: 18000 }, growth: 1.9,
+    gain: { region: 0.06 }, effect: "+6% to everything the region makes", blurb: "A light they can see from every roof in the city." },
+  { id: "ward", name: "Trauma Ward", base: { funding: 60000, leads: 30000 }, growth: 1.9,
+    gain: { resolve: 0.12 }, effect: "+12% resolve", blurb: "Open all night, no questions, no paperwork." },
+  { id: "doctrine", name: "Strike Doctrine", base: { funding: 70000, salvage: 40000 }, growth: 1.9,
+    gain: { power: 0.12 }, effect: "+12% power", blurb: "Everything you learned, written down for the next one." },
+  { id: "spire", name: "Archive Spire", base: { funding: 120000, leads: 60000 }, growth: 1.92,
+    gain: { xp: 0.08, cap: 0.2 }, effect: "+8% XP a kill, +20% storage", blurb: "Every file the city tried to lose, on one floor." },
+  { id: "response", name: "Rapid Response Net", base: { funding: 200000, salvage: 90000 }, growth: 1.95,
+    gain: { cd: 0.04 }, effect: "Abilities recharge 4% faster", blurb: "The call goes out before the glass finishes falling." },
+];
+
+/* --------------------------- black market -------------------------- *
+ *  Leads and salvage move for funding. Every sale floods the market and
+ *  the price sags; leave it alone and it drifts back up. Buying costs
+ *  the spread, which is what makes dumping a full lockup a decision.
+ * ------------------------------------------------------------------ */
+const MARKET = [
+  { id: "leads", value: 0.9 },
+  { id: "salvage", value: 0.7 },
+];
+
+/* Permanent, and the only thing besides legacy that outlives a career. */
+const ACHIEVEMENTS = [
+  ...DISTRICTS.map((dist) => ({ id: "boss_" + dist.id, name: dist.boss.name, blurb: `Beat the boss of ${dist.name}.`, test: (s) => !!s.bosses[dist.id] })),
+  { id: "lv10", name: "Known Quantity", blurb: "Reach level 10.", test: (s, d) => d.level >= 10 },
+  { id: "lv25", name: "Front Page", blurb: "Reach level 25.", test: (s, d) => d.level >= 25 },
+  { id: "lv50", name: "Household Name", blurb: "Reach level 50.", test: (s, d) => d.level >= 50 },
+  { id: "build50", name: "Footprint", blurb: "Hold 50 buildings.", test: (s) => TERRITORY.reduce((n, t) => n + (s.own[t.id] || 0), 0) >= 50 },
+  { id: "build250", name: "Landlord", blurb: "Hold 250 buildings.", test: (s) => TERRITORY.reduce((n, t) => n + (s.own[t.id] || 0), 0) >= 250 },
+  { id: "crew10", name: "A Team", blurb: "Keep ten crew on the books.", test: (s) => s.crew.n >= 10 },
+  { id: "crew40", name: "An Organisation", blurb: "Keep forty crew on the books.", test: (s) => s.crew.n >= 40 },
+  { id: "abilities", name: "Full Kit", blurb: "Open all four abilities.", test: (s) => ABILITIES.every((a) => s.tech[a.tech]) },
+  { id: "project1", name: "Groundbreaking", blurb: "Finish a city project.", test: (s) => PROJECTS.some((p) => (s.projects[p.id]?.done || 0) >= 1) },
+  { id: "project10", name: "Skyline", blurb: "Finish ten city projects.", test: (s) => PROJECTS.reduce((n, p) => n + (s.projects[p.id]?.done || 0), 0) >= 10 },
+  { id: "trade", name: "Fence", blurb: "Move a million funding through the market.", test: (s) => s.traded >= 1000000 },
+  { id: "branch", name: "Specialist", blurb: "Finish a whole branch of the tree.", test: (s) => BRANCHES.some((b) => TECH.every((t) => t.branch !== b.id || s.tech[t.id])) },
+  { id: "legacy1", name: "Succession", blurb: "Pass the cowl on once.", test: (s) => s.runs >= 1 },
+  { id: "legacy5", name: "The Mantle", blurb: "Pass the cowl on five times.", test: (s) => s.runs >= 5 },
+];
+
+/* Live-play flavour: small windfalls and the odd hot streak. Deliberately
+   never fired during offline catch-up, so they can't be farmed by leaving. */
+const EVENTS = [
+  { id: "tip", res: "leads", secs: 180, text: "A payphone rings once and stops. The address is good." },
+  { id: "wreck", res: "salvage", secs: 180, text: "A chase ends in a wall. The wall wins, and you get the pieces." },
+  { id: "benefactor", res: "funding", secs: 180, text: "An envelope, no name on it, and nothing asked for." },
+  { id: "haul", res: "salvage", secs: 420, text: "A container comes off the boat marked as somebody else's." },
+  { id: "grant", res: "funding", secs: 420, text: "The city council finds a line item with your name on it." },
+  { id: "streak", boon: { mult: 1.6, dur: 120 }, text: "The whole district is calling it in at once. Ride it." },
+  { id: "quiet", boon: { mult: 1.35, dur: 240 }, text: "A quiet night, and everyone gets twice as much done." },
+];
+
 /* ---------------------------- the tree ---------------------------- *
  *  branch + tier drive the layout; req drives the wiring.
  *  amp     doubles a power's per-rank value
  *  mult    multiplies a building (or "all" of them)
+ *  cap     multiplies how much of everything you can hold
  *  ability opens one of the four abilities
  *  cost    is flat — tech is bought once
  * ------------------------------------------------------------------ */
@@ -140,13 +225,19 @@ const TECH = [
   /* ---- STREET: the old stuff, but better and cheaper ---- */
   { id: "scanners", branch: "street", tier: 1, name: "Police Scanners", req: [], cost: { salvage: 400, leads: 200 }, mult: { perch: 2 }, effect: "Rooftop perches produce twice as much." },
   { id: "rights", branch: "street", tier: 1, name: "Salvage Rights", req: [], cost: { leads: 500, salvage: 250 }, mult: { yard: 2 }, effect: "Scrap yards produce twice as much." },
+  { id: "crates", branch: "street", tier: 1, name: "Packing Crates", req: [], cost: { salvage: 500, leads: 350 }, cap: 4, effect: "Lockups hold four times as much." },
   { id: "zoning", branch: "street", tier: 2, name: "Zoning Permits", req: ["scanners", "rights"], cost: { funding: 4000, salvage: 3000 }, mult: { all: 2 }, effect: "Every building produces twice as much." },
   { id: "bulk", branch: "street", tier: 2, name: "Bulk Contracts", req: ["rights"], cost: { funding: 3000, leads: 2000 }, cut: { terr: 0.85 }, effect: "Buildings cost 15% less." },
+  { id: "fence", branch: "street", tier: 2, name: "Fence Contacts", req: ["rights"], cost: { leads: 1800, funding: 900 }, effect: "Opens the black market: leads and salvage move for funding." },
+  { id: "recruit", branch: "street", tier: 2, name: "Recruitment Drive", req: ["scanners"], cost: { funding: 3000, leads: 2200 }, effect: "Half again as many beds in every safehouse." },
   { id: "drones", branch: "street", tier: 3, name: "Drone Relays", req: ["zoning"], cost: { leads: 40000, funding: 30000 }, mult: { perch: 3, informants: 2 }, effect: "Perches ×3 again, informants ×2." },
   { id: "union", branch: "street", tier: 3, name: "Union Contract", req: ["zoning"], cost: { salvage: 25000, funding: 30000 }, mult: { yard: 3 }, effect: "Scrap yards ×3 again." },
+  { id: "projects", branch: "street", tier: 3, name: "Civic Projects", req: ["zoning"], cost: { funding: 35000, salvage: 18000 }, effect: "Opens city projects: part-payable works that stack forever." },
+  { id: "vault", branch: "street", tier: 3, name: "Blast Vault", req: ["crates"], cost: { funding: 50000, salvage: 25000 }, cap: 8, effect: "Lockups hold eight times as much again." },
   { id: "civic", branch: "street", tier: 4, name: "Civic Trust", req: ["drones", "union"], cost: { funding: 300000 }, mult: { watch: 3, precinct: 2 }, effect: "Block watches ×3, liaisons ×2." },
   { id: "eminent", branch: "street", tier: 4, name: "Eminent Domain", req: ["bulk"], cost: { funding: 250000, salvage: 60000 }, cut: { terr: 0.8 }, effect: "Buildings cost another 20% less." },
   { id: "uplink", branch: "street", tier: 5, name: "Orbital Uplink", req: ["civic"], cost: { funding: 2500000, leads: 400000 }, effect: "Opens the Signal Tower." },
+  { id: "caches", branch: "street", tier: 5, name: "Compressed Caches", req: ["uplink", "vault"], cost: { funding: 3000000, leads: 700000 }, cap: 12, effect: "Lockups hold twelve times as much again." },
   { id: "boost", branch: "street", tier: 6, name: "Signal Boost", req: ["uplink"], cost: { funding: 20000000, xp: 400000000 }, effect: "Signal towers give 20% each instead of 10%." },
 
   /* ---- BODY: the fight ---- */
@@ -180,9 +271,11 @@ const TECH = [
   { id: "notes", branch: "ops", tier: 1, name: "Field Notes", req: [], cost: { leads: 250, salvage: 250 }, effect: "Shows how long until you can afford anything." },
   { id: "logistics", branch: "ops", tier: 2, name: "Logistics", req: ["bulkorders"], cost: { funding: 2500, salvage: 2000 }, effect: "Buy the most you can afford at once." },
   { id: "standing", branch: "ops", tier: 2, name: "Standing Orders", req: ["notes"], cost: { funding: 3500, leads: 2500 }, effect: "The build queue. Tap anything you can't afford and it waits in line." },
+  { id: "command", branch: "ops", tier: 2, name: "Chain of Command", req: ["bulkorders"], cost: { funding: 4500, salvage: 3500 }, effect: "Crew work half again as hard, and new hands take the busiest job on their own." },
   { id: "triggers", branch: "ops", tier: 3, name: "Reflex Triggers", req: ["standing"], cost: { funding: 50000, xp: 400000 }, effect: "Fires every ability the moment it recharges, even while you're away." },
   { id: "autopilot", branch: "ops", tier: 3, name: "Autopilot", req: ["standing"], cost: { funding: 80000, xp: 1200000 }, effect: "Patrols twice a second without you." },
   { id: "archive", branch: "ops", tier: 3, name: "Deep Archive", req: ["logistics"], cost: { funding: 60000, leads: 40000 }, effect: "Offline progress counts for 24 hours instead of 8." },
+  { id: "network", branch: "ops", tier: 3, name: "Fence Network", req: ["logistics"], cost: { funding: 90000, leads: 50000 }, effect: "A full lockup sells its overflow instead of wasting it." },
   { id: "smart", branch: "ops", tier: 4, name: "Smart Queue", req: ["autopilot"], cost: { funding: 500000, xp: 25000000 }, effect: "Queued orders repeat forever instead of clearing once bought." },
   { id: "contingency", branch: "ops", tier: 4, name: "Contingency Fund", req: ["archive"], cost: { funding: 700000, xp: 35000000 }, effect: "Offline progress runs at full rate instead of half." },
 ];
@@ -202,6 +295,24 @@ const TUNE = {
   safehouseEach: 0.05,   /* cooldowns divided by 1 + this per safehouse */
   gymEach: 0.08,         /* ability magnitude and duration, per floor */
   bossSimSeconds: 600,
+  capBase: { leads: 900, salvage: 900, funding: 500 },
+  capEach: { leads: 2600, salvage: 2600, funding: 1300 },
+  capHeld: 0.25,          /* storage per district held */
+  capTower: 0.1,          /* storage per signal tower */
+  bedsBase: 2,
+  bedsPer: 3,             /* beds per safehouse */
+  crewJoin: 75,           /* seconds for one to walk in, before renown */
+  crewUpkeep: 0.8,        /* funding a second for the first hand... */
+  crewUpkeepStep: 1.055,  /* ...times this for each one after */
+  crewQuit: 45,           /* seconds unpaid before someone walks */
+  marketSpread: 3,        /* buying costs this much more than selling pays */
+  marketDip: 0.22,        /* worst a single dump can move the price */
+  marketRecover: 0.006,   /* share of the gap back to par, a second */
+  marketFloor: 0.25,
+  overflowRate: 0.5,      /* Fence Network sells overflow at half price */
+  eventEvery: 420,        /* mean seconds between live events */
+  achieveBonus: 0.005,
+  logKeep: 40,
   offlineCap: 8 * 3600,
   offlineCapLong: 24 * 3600,
   offlineRate: 0.5,
@@ -224,10 +335,12 @@ const legacyFor = (f) => Math.floor(Math.sqrt(f / TUNE.legacyDivisor));
 
 const freshFight = () => ({ enemyHP: 0, heroHP: 0, ko: 0, boss: false, cd: {}, buff: {}, cast: [], recheck: 0 });
 
+const freshCrew = () => ({ n: 0, grow: 0, unpaid: 0, jobs: JOBS.reduce((o, j) => ((o[j.id] = 0), o), {}) });
+
 const freshState = (legacy = 0) => ({
   hero: null,
   res: { leads: 0, salvage: 0, funding: 0, xp: 0 },
-  own: { perch: 0, yard: 0, watch: 0, safehouse: 0, informants: 0, gym: 0, precinct: 0, tower: 0 },
+  own: { perch: 0, lockup: 0, yard: 0, watch: 0, safehouse: 0, informants: 0, gym: 0, precinct: 0, tower: 0 },
   gear: { rig: 0, padding: 0, trophy: 0, exo: 0 },
   ranks: {},
   tech: {},
@@ -236,13 +349,24 @@ const freshState = (legacy = 0) => ({
   cleared: {},
   bosses: {},
   fight: freshFight(),
+  crew: freshCrew(),
+  market: { leads: 1, salvage: 1 },
+  autosell: {},
+  projects: {},
+  boon: null,
+  log: [],
+  time: 0,
   totalXP: 0,
   legacy,
   careerFunding: 0,
+  /* these five outlive the career: handing the cowl on keeps them */
   allTimeFunding: 0,
+  achieved: {},
+  traded: 0,
+  runs: 0,
 });
 
-/* Old saves predate bosses and the new building slots: fill the gaps, and
+/* Old saves predate bosses, crew, storage and projects: fill the gaps, and
    keep open any district the old fight-count gate had already opened. */
 function migrate(saved) {
   const fresh = freshState();
@@ -253,9 +377,21 @@ function migrate(saved) {
     own: { ...fresh.own, ...st.own },
     gear: { ...fresh.gear, ...st.gear },
     fight: { ...freshFight(), ...st.fight },
+    crew: { ...freshCrew(), ...st.crew, jobs: { ...freshCrew().jobs, ...(st.crew || {}).jobs } },
+    market: { ...fresh.market, ...st.market },
+    autosell: { ...st.autosell },
+    projects: { ...st.projects },
+    achieved: { ...st.achieved },
+    log: Array.isArray(st.log) ? st.log : [],
     tech: { ...st.tech },
     bosses: { ...st.bosses },
   };
+  /* a save from before storage existed would otherwise sit at zero cap
+     with a lockup it never had the chance to buy */
+  if (!st.own || st.own.lockup === undefined) {
+    const built = TERRITORY.reduce((n, t) => n + (back.own[t.id] || 0), 0);
+    back.own.lockup = Math.min(40, Math.ceil(built / 4));
+  }
   if (!st.bosses) {
     if (back.tech.secondwind) { delete back.tech.secondwind; back.tech.conditioning = true; }
     DISTRICTS.forEach((dist) => {
@@ -271,6 +407,24 @@ const powersFor = (hero) => (hero ? [...POWERS, hero.signature] : POWERS);
 const distById = (id) => DISTRICTS.find((x) => x.id === id) || DISTRICTS[0];
 const unlocked = (s, i) => i === 0 || !!s.bosses[DISTRICTS[i - 1].id];
 const bossReady = (s, dist) => !s.bosses[dist.id] && (s.cleared[dist.id] || 0) >= dist.need;
+
+const jobById = (id) => JOBS.find((j) => j.id === id);
+const projectById = (id) => PROJECTS.find((p) => p.id === id);
+
+/* Crew assignments are clamped on read, so a safehouse lost to a reset or
+   a hand who walked can never leave more people working than exist. */
+function crewSplit(s) {
+  const jobs = {};
+  let used = 0;
+  const n = Math.max(0, Math.floor((s.crew && s.crew.n) || 0));
+  for (const j of JOBS) {
+    const want = Math.max(0, Math.floor(((s.crew && s.crew.jobs) || {})[j.id] || 0));
+    const got = Math.min(want, n - used);
+    jobs[j.id] = got;
+    used += got;
+  }
+  return { jobs, n, idle: n - used };
+}
 
 function derive(s, opts = {}) {
   const hero = heroById(s.hero);
@@ -307,19 +461,68 @@ function derive(s, opts = {}) {
   const held = DISTRICTS.filter((x) => s.bosses[x.id]).length;
   const towerEach = tech.boost ? 0.2 : 0.1;
   const levelMult = 1 + TUNE.levelBonus * (level - 1);
+
+  /* city projects: every completion stacks, and they never come back down */
+  const proj = { region: 0, resolve: 0, power: 0, xp: 0, cap: 0 };
+  let projCd = 1, projDone = 0;
+  for (const pr of PROJECTS) {
+    const n = (s.projects[pr.id] || {}).done || 0;
+    if (!n) continue;
+    projDone += n;
+    for (const k in pr.gain) {
+      if (k === "cd") projCd *= Math.pow(1 - pr.gain.cd, n);
+      else proj[k] += pr.gain[k] * n;
+    }
+  }
+
+  /* achievements outlive the career; each one is worth a little of everything */
+  const badges = ACHIEVEMENTS.reduce((n, a) => n + (s.achieved[a.id] ? 1 : 0), 0);
+  const badgeMult = 1 + TUNE.achieveBonus * badges;
+
+  const boon = s.boon && s.boon.left > 0 ? s.boon : null;
+
   const global =
     mult.global * levelMult *
     (1 + TUNE.legacyBonus * s.legacy) *
     (1 + towerEach * s.own.tower) *
     (1 + TUNE.heldBonus * held) *
+    (1 + proj.region) * badgeMult *
+    (boon ? boon.mult : 1) *
     (tech.cascade ? 1 + 0.01 * totalRanks : 1);
 
+  /* ---- crew: beds decide how many, jobs decide what they are worth ---- */
+  const split = crewSplit(s);
+  const beds = Math.floor((TUNE.bedsBase + TUNE.bedsPer * (s.own.safehouse || 0)) * (tech.recruit ? 1.5 : 1));
+  const crewMult = tech.command ? 1.5 : 1;
+  const crewMakes = { leads: 0, salvage: 0, funding: 0 };
+  let crewCombat = 0, crewXP = 0;
+  for (const j of JOBS) {
+    const n = split.jobs[j.id];
+    if (!n) continue;
+    if (j.makes) for (const k in j.makes) crewMakes[k] += j.makes[k] * n * crewMult;
+    if (j.combat) crewCombat += j.combat * n * crewMult;
+    if (j.xp) crewXP += j.xp * n * crewMult;
+  }
+  const upkeep = split.n > 0 ? TUNE.crewUpkeep * (Math.pow(TUNE.crewUpkeepStep, split.n) - 1) / (TUNE.crewUpkeepStep - 1) : 0;
+
   const gross = {
-    leads: (s.own.perch * 0.5 * bMult.perch + s.own.informants * 4 * bMult.informants) * mult.leads * (mods.leads || 1) * global,
-    salvage: s.own.yard * 0.45 * bMult.yard * mult.salvage * (mods.salvage || 1) * global,
-    funding: (s.own.watch * 0.35 * bMult.watch + s.own.precinct * 3.5 * bMult.precinct) * mult.funding * (mods.funding || 1) * global,
+    leads: (s.own.perch * 0.5 * bMult.perch + s.own.informants * 4 * bMult.informants + crewMakes.leads) * mult.leads * (mods.leads || 1) * global,
+    salvage: (s.own.yard * 0.45 * bMult.yard + crewMakes.salvage) * mult.salvage * (mods.salvage || 1) * global,
+    funding: (s.own.watch * 0.35 * bMult.watch + s.own.precinct * 3.5 * bMult.precinct + crewMakes.funding) * mult.funding * (mods.funding || 1) * global,
     xp: 0,
   };
+
+  /* ---- storage: lockups set the ceiling, the tree and the city raise it ---- */
+  let capMult = (1 + TUNE.capHeld * held) * (1 + TUNE.capTower * (s.own.tower || 0)) * (1 + proj.cap) * (1 + TUNE.legacyBonus * s.legacy);
+  for (const t of TECH) if (tech[t.id] && t.cap) capMult *= t.cap;
+  const caps = {};
+  for (const k of ["leads", "salvage", "funding"])
+    caps[k] = Math.floor((TUNE.capBase[k] + TUNE.capEach[k] * (s.own.lockup || 0)) * capMult);
+  caps.xp = Infinity;
+
+  /* ---- the market: par is 1, dumping sags it, time walks it back ---- */
+  const price = {};
+  for (const m of MARKET) price[m.id] = m.value * Math.max(TUNE.marketFloor, (s.market || {})[m.id] || 1);
 
   /* Combat deliberately does NOT use `global`. Economy multipliers scale the
      region; gear, power ranks and the Body branch scale the hero. Letting
@@ -336,15 +539,16 @@ function derive(s, opts = {}) {
   }
   const fightMult =
     (1 + TUNE.legacyBonus * s.legacy) *
+    (1 + crewCombat) * badgeMult *
     (tech.cascade ? 1 + 0.005 * totalRanks : 1) *
     (tech.stims ? 1.5 : 1) *
     (tech.overclock ? 2 : 1);
-  const power = (1 + addPower) * mult.power * fightMult;
-  const resolve = (TUNE.baseResolve + addResolve) * mult.resolve * (mods.resolve || 1) * fightMult;
-  const xpMult = (1 + xpBonus) * mult.xp;
+  const power = (1 + addPower) * mult.power * fightMult * (1 + proj.power);
+  const resolve = (TUNE.baseResolve + addResolve) * mult.resolve * (mods.resolve || 1) * fightMult * (1 + proj.resolve);
+  const xpMult = (1 + xpBonus) * mult.xp * (1 + proj.xp + crewXP);
 
   /* abilities: the tree opens them, the two buildings and Tempo shape them */
-  const cdMult = (tech.tempo ? 0.75 : 1) / (1 + TUNE.safehouseEach * (s.own.safehouse || 0));
+  const cdMult = projCd * (tech.tempo ? 0.75 : 1) / (1 + TUNE.safehouseEach * (s.own.safehouse || 0));
   const abilMult = 1 + TUNE.gymEach * (s.own.gym || 0);
   const abilities = ABILITIES.filter((a) => tech[a.tech]).map((a) => {
     const cd = a.cd * cdMult;
@@ -384,6 +588,8 @@ function derive(s, opts = {}) {
 
   return {
     hero, powers, mult, bMult, cut, level, levelMult, global, gross, totalRanks, towerEach, held,
+    caps, capMult, price, proj, projCd, projDone, badges, badgeMult, boon,
+    crew: split, beds, crewMult, crewMakes, crewCombat, crewXP, upkeep,
     patrol, power, resolve, xpMult, fightMult, dist, ttk, ttkEff, damageTaken, winnable, xpRate,
     abilities, auto, cdMult, abilMult, sustain, intake,
     ko: (tech.medicine ? TUNE.koFast : TUNE.koSeconds) * cdMult,
@@ -392,6 +598,7 @@ function derive(s, opts = {}) {
     xpNeed: nextXP - floorXP,
     xpPct: Math.min(100, ((s.totalXP - floorXP) / (nextXP - floorXP)) * 100),
     region: TERRITORY.reduce((n, t) => n + (s.own[t.id] || 0), 0),
+    full: ["leads", "salvage", "funding"].filter((k) => s.res[k] >= caps[k] - 1e-9),
     cleared: s.cleared[dist.id] || 0,
     techDone: TECH.filter((t) => s.tech[t.id]).length,
   };
@@ -407,6 +614,33 @@ function costOf(item, own, count, discount = 1) {
 }
 
 const powerCost = (p, rank, discount = 1) => ({ xp: Math.ceil(p.base * Math.pow(p.growth, rank) * discount) });
+
+/* What `share` of the next copy of a project costs. Progress is kept, so
+   a project can be paid for in any number of slices. */
+function projectCost(pr, done, share, discount = 1) {
+  const out = {};
+  for (const k in pr.base) out[k] = Math.ceil(pr.base[k] * Math.pow(pr.growth, done) * share * discount);
+  return out;
+}
+
+const projectAt = (s, pr) => s.projects[pr.id] || { done: 0, prog: 0 };
+
+/* The most of a project you could pay for right now, as a share of the whole. */
+function projectMax(s, pr, discount) {
+  const at = projectAt(s, pr);
+  const left = 1 - at.prog;
+  let lo = 0, hi = left;
+  for (let i = 0; i < 24; i++) {
+    const mid = (lo + hi) / 2;
+    if (canPay(projectCost(pr, at.done, mid, discount), s.res)) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/* A sale floods the market: the bigger the dump relative to what you can
+   hold, the further the price sags, and it walks back up on its own. */
+const marketDip = (qty, cap) => 1 - TUNE.marketDip * (qty / (qty + Math.max(1, cap) * 0.25));
 const canPay = (cost, res) => Object.keys(cost).every((k) => res[k] >= cost[k]);
 
 function maxAffordable(item, own, res, discount) {
@@ -557,15 +791,84 @@ function bestDistrict(s, d) {
   return DISTRICTS[0].id;
 }
 
+/* Income stops at the ceiling; windfalls — bounties, gifts, a sale — do
+   not, so nothing you actually won is ever thrown away for want of a
+   lockup. What income spills is either sold by the Fence Network or lost. */
+function pour(res, caps, k, n, spill) {
+  if (!(n > 0)) return;
+  if (k === "xp") { res.xp += n; return; }
+  const room = Math.max(0, caps[k] - res[k]);
+  res[k] += Math.min(n, room);
+  if (spill && n > room) spill[k] = (spill[k] || 0) + (n - room);
+}
+
+const logged = (list, t, text) => [...list, { t: Math.floor(t), text }].slice(-TUNE.logKeep);
+
 function step(s, dt, opts = {}) {
   const d = derive(s, opts);
   const res = { ...s.res };
-  for (const k of RES_IDS) if (k !== "xp") res[k] = Math.max(0, res[k] + d.gross[k] * dt);
+  const caps = d.caps;
+  const spill = {};
+  const note = [];
+  for (const k of RES_IDS) if (k !== "xp") pour(res, caps, k, d.gross[k] * dt, spill);
 
   if (s.tech.autopilot) {
     const auto = d.patrol * TUNE.autopilotRate * dt;
-    res.leads += auto;
-    res.salvage += auto;
+    pour(res, caps, "leads", auto, spill);
+    pour(res, caps, "salvage", auto, spill);
+  }
+
+  /* ---- crew: they turn up if there is a bed, and leave if unpaid ---- */
+  let crew = s.crew, traded = s.traded;
+  {
+    const c = { ...s.crew, jobs: { ...s.crew.jobs } };
+    if (c.n < d.beds) {
+      c.grow += (dt * (1 + 0.15 * d.held)) / TUNE.crewJoin;
+      while (c.grow >= 1 && c.n < d.beds) {
+        c.grow -= 1;
+        c.n += 1;
+        /* A new hand always picks something up — an idle one still draws
+           payroll, and quietly bleeding crew nobody assigned is a trap.
+           Chain of Command puts them where the fewest are, keeping the
+           outfit even; without it they follow the crowd, and Outreach
+           takes the first one so the wages pay for themselves. */
+        const pick = s.tech.command
+          ? JOBS.reduce((a, b) => ((c.jobs[a.id] || 0) <= (c.jobs[b.id] || 0) ? a : b))
+          : JOBS.reduce((a, b) => ((c.jobs[b.id] || 0) > (c.jobs[a.id] || 0) ? b : a), jobById("outreach"));
+        c.jobs[pick.id] = (c.jobs[pick.id] || 0) + 1;
+      }
+      if (c.n >= d.beds) c.grow = 0;
+    } else c.grow = 0;
+
+    const owed = d.upkeep * dt;
+    if (res.funding >= owed) {
+      res.funding -= owed;
+      c.unpaid = 0;
+    } else {
+      res.funding = 0;
+      c.unpaid += dt;
+      while (c.unpaid >= TUNE.crewQuit && c.n > 0) {
+        c.unpaid -= TUNE.crewQuit;
+        c.n -= 1;
+        const busiest = JOBS.filter((j) => (c.jobs[j.id] || 0) > 0).sort((a, b) => c.jobs[b.id] - c.jobs[a.id])[0];
+        if (busiest) c.jobs[busiest.id] -= 1;
+        note.push("Payroll came up short. Somebody handed their key back.");
+      }
+    }
+    crew = c;
+  }
+
+  /* ---- the market walks back to par, and sells the overflow if told to ---- */
+  const market = { ...s.market };
+  for (const m of MARKET) {
+    const idx = market[m.id] ?? 1;
+    if (idx !== 1) market[m.id] = 1 + (idx - 1) * Math.exp(-TUNE.marketRecover * dt);
+    if (s.tech.network && spill[m.id] > 0 && s.autosell[m.id] !== false) {
+      const paid = spill[m.id] * d.price[m.id] * TUNE.overflowRate;
+      pour(res, caps, "funding", paid, null);
+      traded += paid;
+      spill[m.id] = 0;
+    }
   }
 
   const c = combatStep(s, dt, d);
@@ -575,15 +878,24 @@ function step(s, dt, opts = {}) {
   const next = {
     ...s,
     res,
+    crew,
+    market,
+    traded,
     fight: c.fight,
+    time: (s.time || 0) + dt,
     cleared: c.kills ? { ...s.cleared, [s.district]: (s.cleared[s.district] || 0) + c.kills } : s.cleared,
     totalXP: s.totalXP + c.xp,
     careerFunding: s.careerFunding + d.gross.funding * dt,
     allTimeFunding: s.allTimeFunding + d.gross.funding * dt,
   };
+  if (s.boon) {
+    const left = s.boon.left - dt;
+    next.boon = left > 0 ? { ...s.boon, left } : null;
+  }
   if (c.bossWin) {
     next.bosses = { ...s.bosses, [d.dist.id]: true };
     for (const k in d.dist.boss.bounty) res[k] += d.dist.boss.bounty[k];
+    note.push(`${d.dist.boss.name} is down. ${d.dist.name} is yours.`);
   }
   if (q) {
     next.queue = q.queue;
@@ -604,6 +916,34 @@ function step(s, dt, opts = {}) {
       } else next.fight = { ...next.fight, recheck: 15 };
     }
   }
+
+  /* Live-play only: a long offline catch-up runs in slices of minutes, and
+     rolling an event per slice would turn leaving into a strategy. */
+  if (dt <= 5 && !opts.quiet && Math.random() < dt / TUNE.eventEvery) {
+    const e = EVENTS[Math.floor(Math.random() * EVENTS.length)];
+    if (e.boon) {
+      next.boon = { id: e.id, mult: e.boon.mult, left: e.boon.dur };
+      note.push(`${e.text} ×${e.boon.mult} region for ${Math.round(e.boon.dur)}s.`);
+    } else {
+      const gain = Math.max(caps[e.res] * 0.06, d.gross[e.res] * e.secs);
+      next.res = { ...next.res, [e.res]: next.res[e.res] + gain };
+      note.push(`${e.text} +${amt(gain)} ${nameOf(e.res).toLowerCase()}.`);
+    }
+  }
+
+  /* Achievements are checked on the state we are about to hand back, and
+     are kept when the cowl changes hands. */
+  const lv = { level: levelOf(next.totalXP) };
+  for (const a of ACHIEVEMENTS) {
+    if (next.achieved[a.id]) continue;
+    let hit = false;
+    try { hit = !!a.test(next, lv); } catch { hit = false; }
+    if (!hit) continue;
+    next.achieved = { ...next.achieved, [a.id]: true };
+    note.push(`Achievement: ${a.name}. +${(TUNE.achieveBonus * 100).toFixed(1)}% to everything, for good.`);
+  }
+
+  if (note.length) next.log = note.reduce((l, text) => logged(l, next.time, text), s.log || []);
   return next;
 }
 
@@ -638,15 +978,17 @@ function duration(sec) {
 
 const secs = (t) => (!isFinite(t) ? "never" : t < 10 ? t.toFixed(1) + "s" : t < 600 ? Math.round(t) + "s" : duration(t));
 const x = (n) => (n >= 100 ? "×" + amt(n) : "×" + n.toFixed(n < 10 ? 2 : 1));
-const pct = (n) => (n * 100).toFixed(0) + "%";
+const pct = (n) => (Math.abs(n) < 0.01 && n !== 0 ? (n * 100).toFixed(1) : (n * 100).toFixed(0)) + "%";
 const nameOf = (id) => RESOURCES.find((r) => r.id === id)?.name ?? id;
 const toneOf = (id) => RESOURCES.find((r) => r.id === id)?.tone ?? "plain";
 
 /* Exposed for the balance script in scripts/. Not used by the UI. */
 export const engine = {
   RESOURCES, HEROES, POWERS, DISTRICTS, ABILITIES, GEAR, TERRITORY, TECH, TUNE,
+  JOBS, PROJECTS, MARKET, ACHIEVEMENTS,
   freshState, migrate, derive, step, costOf, powerCost, canPay, maxAffordable,
   unlocked, bossReady, forecastBoss, startBoss, bestDistrict, levelOf,
+  crewSplit, projectCost, projectMax, projectAt, marketDip,
 };
 
 /* ============================ THE HOOK ============================ */
@@ -807,7 +1149,8 @@ function useGame() {
     }
     return worst;
   };
-  const etaLabel = (cost, ok) => (!s.tech.notes || ok ? null : secs(eta(cost)));
+  const overCap = (cost) => Object.keys(cost).some((k) => k !== "xp" && cost[k] > d.caps[k]);
+  const etaLabel = (cost, ok) => (ok ? null : overCap(cost) ? "no room" : !s.tech.notes ? null : secs(eta(cost)));
 
   /* ---- tooltip copy ---- */
   const RES_TEXT = {
@@ -818,8 +1161,11 @@ function useGame() {
   };
   const resTip = (id) =>
     id === "xp"
-      ? `${RES_TEXT.xp} ${d.winnable ? `${d.dist.name} is paying ${rate(d.xpRate)}/s${d.auto ? ", abilities included" : ""}.` : `You aren't clearing ${d.dist.name}, so nothing is coming in.`}`
-      : `${RES_TEXT[id]} Coming in at ${rate(d.gross[id])}/s.`;
+      ? `${RES_TEXT.xp} ${d.winnable ? `${d.dist.name} is paying ${rate(d.xpRate)}/s${d.auto ? ", abilities included" : ""}.` : `You aren't clearing ${d.dist.name}, so nothing is coming in.`} Nothing caps XP.`
+      : `${RES_TEXT[id]} Coming in at ${rate(d.gross[id])}/s, and you can hold ${amt(d.caps[id])}. ` +
+        (s.res[id] >= d.caps[id] - 1e-9
+          ? `You are full: income is spilling${s.tech.network && id !== "funding" && s.autosell[id] !== false ? ", though the Fence Network is selling it" : " and being lost"}. Buy a Lockup.`
+          : `Lockups raise that; bounties and gifts can go over it.`);
 
   const levelTip = () =>
     `Level ${d.level}, off ${amt(s.totalXP)} XP earned this career. Each level above the first adds ${pct(TUNE.levelBonus)} to the region, so level alone has you at ${x(d.levelMult)}. ` +
@@ -880,9 +1226,13 @@ function useGame() {
 
   const terrTip = (t) => {
     const own = s.own[t.id] || 0;
+    if (t.id === "lockup")
+      return `${t.blurb} Each one holds another ${amt(TUNE.capEach.leads * d.capMult)} leads and salvage and ${amt(TUNE.capEach.funding * d.capMult)} funding. ` +
+        `Income stops dead at the ceiling — a bounty, a gift or a sale can go over it, but nothing you produce will. ${own} of them have you at ${amt(d.caps.funding)} funding.`;
     if (t.id === "tower") return `${t.blurb} Each one adds ${pct(d.towerEach)} to everything the region produces, and they stack.`;
     if (t.id === "safehouse") return `${t.blurb} Each one cuts ability recharge and knockout time by another ${pct(TUNE.safehouseEach)} of the base. ${own} of them have recharge at ${x(1 / (1 + TUNE.safehouseEach * own))}.`;
     if (t.id === "gym") return `${t.blurb} Each one adds ${pct(TUNE.gymEach)} to what every ability does: Haymaker damage, Second Wind healing, and how long Brace and Surge last. ${own} of them have abilities at ${x(d.abilMult)}.`;
+    if (!t.makes) return `${t.blurb} You hold ${own}.`;
     const each = (t.id === "informants" ? 4 : t.rate) * d.bMult[t.id] * d.mult[t.makes] * ((d.hero?.mods || {})[t.makes] || 1) * d.global;
     return `${t.blurb} You hold ${own}, at ${rate(each * own)} ${nameOf(t.makes).toLowerCase()} a second. Tech has these at ${x(d.bMult[t.id])} and your powers at ${x(d.mult[t.makes])}. Each costs ${pct(t.growth - 1)} more than the last.`;
   };
@@ -926,6 +1276,39 @@ function useGame() {
     (s.tech.smart
       ? `Smart Queue is running, so orders go to the back of the line instead of clearing — the queue cycles forever.`
       : `Each order clears once bought. Smart Queue in the Ops branch makes them repeat.`);
+
+  const storageTip = () =>
+    `Every lockup you hold raises the ceiling on leads, salvage and funding. Income stops dead at the ceiling — a bounty, a gift or a sale can go over it, but nothing you produce will. ` +
+    `Holding districts, signal towers, the Archive Spire and the storage tree all widen it; you are at ${x(d.caps.funding / (TUNE.capBase.funding + TUNE.capEach.funding * (s.own.lockup || 0)))} on the base.`;
+
+  const crewTip = () =>
+    `People who work for you. Safehouses are beds and beds are the only reason anyone stays, so ${d.beds} is your ceiling; one more walks in every ${Math.round(TUNE.crewJoin / (1 + 0.15 * d.held))}s while there is room. ` +
+    `Payroll runs at ${rate(d.upkeep)} funding a second and climbs steeply with the size of the outfit — miss it for ${TUNE.crewQuit}s and somebody hands their key back. ` +
+    `New hands put themselves to work on the way in${s.tech.command ? ", on whichever job has the fewest" : ", following whoever is busiest"}. ` +
+    (d.crew.idle ? `${d.crew.idle} of them are standing around doing nothing.` : `All ${d.crew.n} are working.`);
+
+  const jobTip = (j) => {
+    const n = d.crew.jobs[j.id] || 0;
+    const what = j.makes
+      ? Object.keys(j.makes).map((k) => `${rate(j.makes[k] * d.crewMult * d.mult[k] * ((d.hero?.mods || {})[k] || 1) * d.global)} ${nameOf(k).toLowerCase()}/s`).join(" and ")
+      : j.combat ? `+${pct(j.combat * d.crewMult)} power and resolve`
+      : `+${pct(j.xp * d.crewMult)} XP a kill`;
+    return `${j.blurb} Each hand on this is worth ${what}. ${n} assigned${s.tech.command ? ", and Chain of Command has them working half again as hard" : ""}.`;
+  };
+
+  const marketTip = (id) =>
+    `${nameOf(id)} moves at ${rate(d.price[id])} funding each, ${pct((s.market[id] ?? 1))} of par. ` +
+    `Dumping a pile floods the market and the price sags; leave it alone and it walks back to par on its own. Buying back costs ${TUNE.marketSpread}× what selling pays, which is the whole reason a fence has a house. ` +
+    (s.tech.network ? `Fence Network is ${s.autosell[id] === false ? "off for this one" : "selling the overflow at half price"}.` : `Fence Network in Ops would sell your overflow for you.`);
+
+  const projectTip = (pr) => {
+    const at = projectAt(s, pr);
+    return `${pr.blurb} Every one finished is ${pr.effect.toLowerCase()}, and it never comes back down. ` +
+      `${at.done} finished, ${pct(at.prog)} of the way into the next. Pay any slice you like — progress is kept, and the next one costs ${pct(pr.growth - 1)} more than the last.`;
+  };
+
+  const achieveTip = () =>
+    `Every one is worth +${pct(TUNE.achieveBonus)} to the region and to the fight, and they are the one thing besides legacy that survives passing the cowl on. ${d.badges} of ${ACHIEVEMENTS.length} so far, running at ${x(d.badgeMult)}.`;
 
   const legacyTip = () =>
     `Left behind by every hero before you. Each point adds ${pct(TUNE.legacyBonus)} to the region and to combat, and never goes away. Passing the cowl is the only way to earn it, and the only thing it doesn't burn.`;
@@ -998,6 +1381,81 @@ function useGame() {
       return { ...p, res: { ...p.res, xp: p.res.xp - cost.xp }, ranks: { ...p.ranks, [pw.id]: rank + 1 } };
     });
 
+  /* ---- crew ---- */
+  const assign = (jobId, n) =>
+    setS((p) => {
+      const split = crewSplit(p);
+      const have = split.jobs[jobId] || 0;
+      const want = n === "max" ? have + split.idle : n === "none" ? 0 : Math.max(0, Math.min(have + n, have + split.idle));
+      if (want === have) return p;
+      return { ...p, crew: { ...p.crew, jobs: { ...split.jobs, [jobId]: want } } };
+    });
+  const spreadCrew = () =>
+    setS((p) => {
+      const split = crewSplit(p);
+      const each = Math.floor(split.n / JOBS.length);
+      const jobs = {};
+      JOBS.forEach((j, i) => (jobs[j.id] = each + (i < split.n % JOBS.length ? 1 : 0)));
+      return { ...p, crew: { ...p.crew, jobs } };
+    });
+  const clearCrew = () => setS((p) => ({ ...p, crew: { ...p.crew, jobs: freshCrew().jobs } }));
+
+  /* ---- market ---- */
+  const sell = (id, share) =>
+    setS((p) => {
+      const dd = derive(p);
+      const price = dd.price[id];
+      const room = Math.max(0, dd.caps.funding - p.res.funding);
+      const qty = Math.min(p.res[id] * share, price > 0 ? room / price : 0);
+      if (!(qty > 0.5)) return p;
+      const paid = qty * price;
+      return {
+        ...p,
+        res: { ...p.res, [id]: p.res[id] - qty, funding: p.res.funding + paid },
+        market: { ...p.market, [id]: Math.max(TUNE.marketFloor, (p.market[id] ?? 1) * marketDip(qty, dd.caps[id])) },
+        traded: p.traded + paid,
+      };
+    });
+
+  const acquire = (id, share) =>
+    setS((p) => {
+      const dd = derive(p);
+      const unit = dd.price[id] * TUNE.marketSpread;
+      const room = Math.max(0, dd.caps[id] - p.res[id]);
+      const qty = Math.min(room, unit > 0 ? (p.res.funding * share) / unit : 0);
+      if (!(qty > 0.5)) return p;
+      const spent = qty * unit;
+      return {
+        ...p,
+        res: { ...p.res, [id]: p.res[id] + qty, funding: p.res.funding - spent },
+        traded: p.traded + spent,
+      };
+    });
+
+  const toggleSell = (id) =>
+    setS((p) => ({ ...p, autosell: { ...p.autosell, [id]: p.autosell[id] === false } }));
+
+  /* ---- city projects ---- */
+  const fund = (pr, share) =>
+    setS((p) => {
+      const dd = derive(p);
+      const at = projectAt(p, pr);
+      const want = share === "max" ? projectMax(p, pr, dd.cut.tech) : Math.min(share, 1 - at.prog);
+      if (!(want > 1e-4)) return p;
+      const cost = projectCost(pr, at.done, want, dd.cut.tech);
+      if (!canPay(cost, p.res)) return p;
+      const res = { ...p.res };
+      for (const k in cost) res[k] -= cost[k];
+      const prog = at.prog + want;
+      const finished = prog >= 1 - 1e-6;
+      return {
+        ...p,
+        res,
+        projects: { ...p.projects, [pr.id]: finished ? { done: at.done + 1, prog: 0 } : { done: at.done, prog } },
+        log: finished ? logged(p.log, p.time, `${pr.name} is finished. ${pr.effect}, for good.`) : p.log,
+      };
+    });
+
   const research = (t) =>
     setS((p) => {
       const dd = derive(p);
@@ -1010,7 +1468,14 @@ function useGame() {
 
   const handOver = () => {
     const gain = legacyFor(s.careerFunding);
-    setS((p) => ({ ...freshState(p.legacy + gain), allTimeFunding: p.allTimeFunding }));
+    setS((p) => ({
+      ...freshState(p.legacy + gain),
+      allTimeFunding: p.allTimeFunding,
+      achieved: p.achieved,
+      traded: p.traded,
+      runs: (p.runs || 0) + 1,
+      log: logged(p.log, 0, `The cowl changes hands. +${gain} legacy carried into the next one.`),
+    }));
     setArmed(null);
     setTab("fight");
   };
@@ -1035,9 +1500,11 @@ function useGame() {
   const priceGear = priceIn("gear", "gear");
 
   const yieldOf = (t) =>
-    t.id === "tower" ? `+${pct(d.towerEach)} region each`
+    t.id === "lockup" ? `+${amt(TUNE.capEach.leads * d.capMult)} leads & salvage, +${amt(TUNE.capEach.funding * d.capMult)} funding held`
+    : t.id === "tower" ? `+${pct(d.towerEach)} region each`
     : t.id === "safehouse" ? `recharge ${x(1 / (1 + TUNE.safehouseEach * (s.own.safehouse || 0)))} · −${pct(TUNE.safehouseEach)} each`
     : t.id === "gym" ? `abilities ${x(d.abilMult)} · +${pct(TUNE.gymEach)} each`
+    : !t.makes ? "held"
     : `${rate((t.id === "informants" ? 4 : t.rate) * d.bMult[t.id] * d.mult[t.makes] * ((d.hero?.mods || {})[t.makes] || 1) * d.global)} ${nameOf(t.makes).toLowerCase()}/s each`;
 
   const gearLine = (gi) =>
@@ -1060,18 +1527,37 @@ function useGame() {
   const bossUp = bossReady(s, d.dist) && !s.fight.boss;
   const todo = {
     fight: bossUp ? "boss" : shownGear.filter((gi) => priceGear(gi).ok).length,
-    region: shownTerritory.filter((t) => priceTerr(t).ok).length,
+    region: d.full.length ? "!" : shownTerritory.filter((t) => priceTerr(t).ok).length,
+    crew: d.crew.idle,
     powers: d.powers.filter((p) => canPay(powerCost(p, s.ranks[p.id] || 0, d.cut.rank), s.res)).length,
     tech: TECH.filter(canBuyTech).length,
+    projects: PROJECTS.filter((pr) => canPay(projectCost(pr, projectAt(s, pr).done, 0.01, d.cut.tech), s.res)).length,
     legacy: 0,
   };
 
+  /* tabs earn their place: crew appears with the first safehouse, projects
+     with the tech that opens them */
+  const tabs = [
+    ["fight", "Fight"],
+    ["region", "Region"],
+    ...(s.own.safehouse > 0 ? [["crew", "Crew"]] : []),
+    ["powers", "Powers"],
+    ["tech", "Tech"],
+    ...(s.tech.projects ? [["projects", "Works"]] : []),
+    ["legacy", "Legacy"],
+  ];
+
   return {
-    s, d, ready, tab, setTab, branch, setBranch, mode, setMode, modes, todo, forecast, bossUp,
+    s, d, ready, tab: tabs.some(([id]) => id === tab) ? tab : "fight", setTab, branch, setBranch,
+    mode, setMode, modes, todo, tabs, forecast, bossUp,
     away, setAway, news, setNews, armed, setArmed, saveNote, tip, setTip, tipProps, hoverTip, TIP_W,
     resTip, levelTip, heroTip, fightTip, distTip, bossTip, abilityTip, abilitiesTip, gearTip, terrTip, powerTip,
-    techTip, techEffect, queueTip, legacyTip, etaLabel,
+    techTip, techEffect, queueTip, legacyTip, etaLabel, storageTip, crewTip, jobTip, marketTip, projectTip, achieveTip,
     choose, setDistrict, patrol, cast, challenge, retreat, claim, equip, train, research, handOver, wipe,
+    assign, spreadCrew, clearCrew, sell, acquire, toggleSell, fund,
+    projectPrice: (pr, share) => projectCost(pr, projectAt(s, pr).done, share, d.cut.tech),
+    projectAt: (pr) => projectAt(s, pr),
+    projectMax: (pr) => projectMax(s, pr, d.cut.tech),
     enqueue, dequeue, clearQueue, queued,
     priceTerr, priceGear,
     yieldOf, gearLine, techCost: (t) => costOf(t, 0, 1, d.cut.tech), techState, canBuyTech,
@@ -1373,6 +1859,192 @@ function Fight({ g }) {
   );
 }
 
+/* The crew: beds, payroll, and five jobs to split them between. */
+function Crew({ g }) {
+  const { s, d } = g;
+  const full = d.crew.n >= d.beds;
+  const short = d.upkeep > d.gross.funding;
+  return (
+    <>
+      <Section label="Crew" sub={`${d.crew.n}/${d.beds} beds · ${d.crew.idle} idle`} g={g} />
+      <Slab
+        flat
+        label="The Outfit"
+        count={d.crew.n}
+        countLabel={`${d.crew.n} on the books`}
+        sub={
+          (full
+            ? `Every bed is taken. Another Safehouse is the only way to make room.`
+            : `One more walks in every ${Math.round(TUNE.crewJoin / (1 + 0.15 * d.held))}s.`) +
+          ` · payroll ${rate(d.upkeep)} funding/s`
+        }
+        res={s.res}
+        ok
+        tip={g.tipProps("crew", "Crew", g.crewTip())}
+      />
+      {short && (
+        <p className="n-verdict bad">
+          Payroll wants {rate(d.upkeep)}/s against {rate(d.gross.funding)}/s coming in. Put more of them on
+          Outreach, or start handing keys back.
+        </p>
+      )}
+      <div className="n-sec">
+        <span className="n-sec-l">Assignments</span>
+        <span className="n-sec-s">{d.crew.idle} idle · idle hands still cost payroll</span>
+        <span className="n-modes">
+          <button className="n-mode" onClick={g.spreadCrew}>split evenly</button>
+          <button className="n-mode" onClick={g.clearCrew}>stand down</button>
+        </span>
+      </div>
+      <div className="n-list">
+        {JOBS.map((j) => {
+          const n = d.crew.jobs[j.id] || 0;
+          const what = j.makes
+            ? Object.keys(j.makes).map((k) => `${rate(j.makes[k] * d.crewMult * d.mult[k] * ((d.hero?.mods || {})[k] || 1) * d.global)} ${nameOf(k).toLowerCase()}/s`).join(" · ")
+            : j.combat ? `+${pct(j.combat * d.crewMult)} power & resolve`
+            : `+${pct(j.xp * d.crewMult)} xp/kill`;
+          return (
+            <div className="n-item flat n-job" key={j.id}>
+              <div className="n-item-top">
+                <span className="n-name">{j.name}</span>
+                <span className="n-top-right">
+                  <span className="n-count">{n}</span>
+                  <button className="n-info" {...g.tipProps("j-" + j.id, j.name, g.jobTip(j))}>?</button>
+                </span>
+              </div>
+              <div className="n-item-bot">
+                <span className="n-sub">{what} each</span>
+                <span className="n-crew-btns">
+                  <button className="n-mode" disabled={!n} onClick={() => g.assign(j.id, -1)}>−</button>
+                  <button className="n-mode" disabled={!d.crew.idle} onClick={() => g.assign(j.id, 1)}>+</button>
+                  <button className="n-mode" disabled={!d.crew.idle} onClick={() => g.assign(j.id, "max")}>all</button>
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+/* The black market: dump what you are drowning in, buy what you are short of. */
+function Market({ g }) {
+  const { s, d } = g;
+  if (!s.tech.fence) return null;
+  return (
+    <>
+      <Section label="Black Market" sub="dumping sags the price · it walks back on its own" g={g} />
+      <div className="n-list">
+        {MARKET.map((m) => {
+          const idx = s.market[m.id] ?? 1;
+          const stock = s.res[m.id];
+          return (
+            <div className="n-item flat" key={m.id}>
+              <div className="n-item-top">
+                <span className="n-name">{nameOf(m.id)}</span>
+                <span className="n-top-right">
+                  <span className="n-count">{rate(d.price[m.id])} each</span>
+                  <button className="n-info" {...g.tipProps("m-" + m.id, nameOf(m.id), g.marketTip(m.id))}>?</button>
+                </span>
+              </div>
+              <div className="n-item-bot">
+                <span className="n-sub">
+                  {pct(idx)} of par · buy at {rate(d.price[m.id] * TUNE.marketSpread)}
+                  {s.tech.network && (
+                    <button className={"n-toggle " + (s.autosell[m.id] === false ? "" : "on")} onClick={() => g.toggleSell(m.id)}>
+                      auto-sell {s.autosell[m.id] === false ? "off" : "on"}
+                    </button>
+                  )}
+                </span>
+                <span className="n-crew-btns">
+                  <button className="n-mode" disabled={!(stock > 1)} onClick={() => g.sell(m.id, 0.25)}>sell ¼</button>
+                  <button className="n-mode" disabled={!(stock > 1)} onClick={() => g.sell(m.id, 1)}>sell all</button>
+                  <button className="n-mode" disabled={!(s.res.funding > 1)} onClick={() => g.acquire(m.id, 0.25)}>buy ¼</button>
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+/* City projects: pay any slice, keep the progress, stack the bonus forever. */
+function Works({ g }) {
+  const { s, d } = g;
+  const shares = [
+    ["1%", 0.01], ["10%", 0.1], ["25%", 0.25], ["max", "max"],
+  ];
+  return (
+    <>
+      <p className="n-note">
+        Works too big to buy in one go. Pay whatever slice you can afford — the progress is kept, and
+        every one you finish stacks for the rest of the career. {d.projDone} finished so far.
+      </p>
+      <div className="n-list">
+        {PROJECTS.map((pr) => {
+          const at = g.projectAt(pr);
+          const max = g.projectMax(pr);
+          const one = g.projectPrice(pr, 0.01);
+          return (
+            <div className="n-item flat n-work" key={pr.id}>
+              <div className="n-item-top">
+                <span className="n-name">{pr.name}</span>
+                <span className="n-top-right">
+                  <span className="n-count">{at.done ? `×${at.done}` : "new"}</span>
+                  <button className="n-info" {...g.tipProps("pr-" + pr.id, pr.name, g.projectTip(pr))}>?</button>
+                </span>
+              </div>
+              <p className="n-node-eff">{pr.effect}{at.done ? `, ${at.done} time${at.done === 1 ? "" : "s"} over` : ""}</p>
+              <div className="n-track work"><div className="n-fill" style={{ width: pct(at.prog) }} /></div>
+              <div className="n-item-bot">
+                <span className="n-sub">{pct(at.prog)} built · 1% costs <Price cost={one} res={s.res} /></span>
+                <span className="n-crew-btns">
+                  {shares.map(([label, share]) => (
+                    <button
+                      key={label}
+                      className="n-mode"
+                      disabled={share === "max" ? !(max > 1e-4) : !canPay(g.projectPrice(pr, Math.min(share, 1 - at.prog)), s.res)}
+                      onClick={() => g.fund(pr, share)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+/* A rolling record of everything the city did while you were looking elsewhere. */
+function Log({ g }) {
+  const [open, setOpen] = useState(false);
+  const log = g.s.log || [];
+  if (!log.length) return null;
+  const shown = open ? [...log].reverse() : log.slice(-1);
+  return (
+    <div className={"n-log " + (open ? "open" : "")}>
+      <button className="n-log-key" onClick={() => setOpen(!open)}>
+        Log <span className="n-log-caret">{open ? "▾" : "▸"}</span>
+      </button>
+      <div className="n-log-lines">
+        {shown.map((l, i) => (
+          <p className="n-log-line" key={log.length - i}>
+            <span className="n-log-t">{duration(l.t)}</span>
+            {l.text}
+          </p>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* The tech tree: branch chips, then tiers hanging off a trunk. */
 function Tree({ g }) {
   const { s } = g;
@@ -1460,7 +2132,7 @@ export default function Mantle() {
 
       <header className="n-top">
         <nav className="n-tabs" role="tablist">
-          {[["fight", "Fight"], ["region", "Region"], ["powers", "Powers"], ["tech", "Tech"], ["legacy", "Legacy"]].map(
+          {g.tabs.map(
             ([id, label]) => (
               <button
                 key={id}
@@ -1470,7 +2142,11 @@ export default function Mantle() {
                 onClick={() => g.setTab(id)}
               >
                 {label}
-                {g.todo[id] ? <span className={"n-badge " + (g.todo[id] === "boss" ? "hot" : "")}>{g.todo[id] === "boss" ? "!" : g.todo[id]}</span> : null}
+                {g.todo[id] ? (
+                  <span className={"n-badge " + (typeof g.todo[id] === "string" ? "hot" : "")}>
+                    {typeof g.todo[id] === "string" ? "!" : g.todo[id]}
+                  </span>
+                ) : null}
               </button>
             )
           )}
@@ -1488,16 +2164,27 @@ export default function Mantle() {
             <button className="n-key tip-host n-lvkey" {...tipProps("level", "Level", g.levelTip())}>
               region {x(d.global)}
             </button>
+            {d.boon && <div className="n-boon">streak ×{d.boon.mult} · {Math.ceil(d.boon.left)}s</div>}
           </div>
-          {RESOURCES.map((r) => (
-            <div key={r.id} className={"n-stat tone-" + r.tone}>
-              <button className="n-key tip-host" {...tipProps("res-" + r.id, r.name, g.resTip(r.id))}>
-                {r.name}
-              </button>
-              <div className="n-val">{amt(s.res[r.id])}</div>
-              <div className={"n-flow " + (r.id === "xp" && !d.winnable ? "neg" : "")}>+{rate(d.gross[r.id])}/s</div>
-            </div>
-          ))}
+          {RESOURCES.map((r) => {
+            const cap = d.caps[r.id];
+            const full = isFinite(cap) && s.res[r.id] >= cap - 1e-9;
+            return (
+              <div key={r.id} className={"n-stat tone-" + r.tone + (full ? " full" : "")}>
+                <button className="n-key tip-host" {...tipProps("res-" + r.id, r.name, g.resTip(r.id))}>
+                  {r.name}
+                </button>
+                <div className="n-val">{amt(s.res[r.id])}</div>
+                <div className={"n-flow " + (r.id === "xp" && !d.winnable ? "neg" : "")}>+{rate(d.gross[r.id])}/s</div>
+                {isFinite(cap) && (
+                  <>
+                    <div className="n-track thin"><div className="n-fill" style={{ width: pct(Math.min(1, s.res[r.id] / cap)) }} /></div>
+                    <div className="n-cap">{full ? "FULL " : "/"}{amt(cap)}</div>
+                  </>
+                )}
+              </div>
+            );
+          })}
         </aside>
 
         <main className="n-main">
@@ -1513,6 +2200,8 @@ export default function Mantle() {
               <button className="n-x" onClick={() => g.setNews(null)}>OK</button>
             </div>
           )}
+
+          <Log g={g} />
 
           {(g.tab === "region" || g.tab === "fight") && <Queue g={g} />}
 
@@ -1546,6 +2235,12 @@ export default function Mantle() {
               </div>
             </>
           )}
+
+          {g.tab === "region" && <Market g={g} />}
+
+          {g.tab === "crew" && <Crew g={g} />}
+
+          {g.tab === "projects" && <Works g={g} />}
 
           {g.tab === "powers" && (
             <>
@@ -1611,6 +2306,21 @@ export default function Mantle() {
                   onBuy={() => (g.armed === "hand" ? g.handOver() : g.setArmed("hand"))}
                 />
               )}
+              <Section label="Record" sub={`${d.badges}/${ACHIEVEMENTS.length} · +${pct(TUNE.achieveBonus)} each, kept forever`} g={g} />
+              <p className="n-note">
+                <button className="n-key tip-host" {...tipProps("badges", "The record", g.achieveTip())}>
+                  everything at {x(d.badgeMult)}
+                </button>
+              </p>
+              <div className="n-badges">
+                {ACHIEVEMENTS.map((a) => (
+                  <span key={a.id} className={"n-badge-card " + (s.achieved[a.id] ? "got" : "")} title={a.blurb}>
+                    <b>{a.name}</b>
+                    {a.blurb}
+                  </span>
+                ))}
+              </div>
+
               <div className="n-foot">
                 <span>{g.saveNote}</span>
                 <button
@@ -1884,6 +2594,33 @@ const CSS = `
 .n-node .n-price { margin-top: 5px; }
 .n-tick { font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; opacity: .7; }
 
+/* ---- storage, crew, market, works, log ---- */
+.n-track.thin { height: 3px; margin-top: 3px; }
+.n-track.work { height: 6px; margin: 5px 0 1px; }
+.n-boon { margin-top: 3px; background: var(--yellow); border: 1.5px solid var(--ink); font-size: 8.5px; font-weight: 700; text-align: center; line-height: 14px; }
+.n-cap { font-size: 8.5px; opacity: .45; font-variant-numeric: tabular-nums; margin-top: 1px; }
+.n-stat.full .n-cap { opacity: 1; color: var(--red); font-weight: 700; }
+.n-stat.full .n-fill { background: var(--red); }
+.n-crew-btns { display: flex; gap: 3px; flex-wrap: wrap; }
+.n-crew-btns .n-mode { min-width: 22px; }
+.n-mode:disabled { opacity: .35; cursor: not-allowed; }
+.n-job .n-item-bot, .n-work .n-item-bot { margin-top: 5px; }
+.n-toggle { margin-left: 7px; background: #fff; border: 1.5px solid var(--ink); padding: 0 5px; font-size: 9.5px; font-weight: 700; line-height: 15px; }
+.n-toggle.on { background: var(--yellow); }
+.n-work .n-sub { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.n-work .n-sub span { border: 1.5px solid var(--ink); padding: 0 5px; font-size: 10px; font-weight: 700; line-height: 16px; }
+.n-log { border: 1.5px dashed var(--ink); background: rgba(255,255,255,.4); padding: 3px 8px 4px; margin-bottom: 9px; display: flex; gap: 8px; align-items: flex-start; }
+.n-log-key { background: none; border: none; padding: 0; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; opacity: .62; flex-shrink: 0; line-height: 15px; }
+.n-log-caret { opacity: .6; }
+.n-log-lines { flex: 1; min-width: 0; max-height: 132px; overflow-y: auto; }
+.n-log-line { margin: 0; font-size: 10.5px; opacity: .8; line-height: 1.35; }
+.n-log:not(.open) .n-log-line { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.n-log-t { display: inline-block; min-width: 42px; padding-right: 7px; opacity: .45; font-variant-numeric: tabular-nums; }
+.n-badges { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 5px; margin-bottom: 10px; }
+.n-badge-card { border: 1.5px dashed var(--ink); padding: 3px 7px 4px; font-size: 10px; opacity: .5; line-height: 1.3; }
+.n-badge-card b { display: block; font-family: var(--head); font-size: 12px; letter-spacing: .03em; text-transform: uppercase; font-weight: 400; }
+.n-badge-card.got { border-style: solid; background: #fff; box-shadow: 2px 2px 0 var(--ink); opacity: 1; }
+
 /* ---- patrol ---- */
 .n-patrol {
   flex-shrink: 0; border: none; border-top: 3px solid var(--ink);
@@ -1920,6 +2657,8 @@ const CSS = `
   .n-hp-num { width: 40px; }
   .n-abil { flex-basis: 45%; max-width: none; }
   .n-abils-info { display: none; }
+  .n-badges { grid-template-columns: 1fr; }
+  .n-cap { font-size: 8px; }
   .n-sec-s { display: none; }
   .n-queue-empty { display: none; }
 }
