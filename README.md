@@ -32,6 +32,23 @@ A superhero incremental game: pick a hero, hold a city, get stronger.
 - **Powers** — ranks bought with XP, multiplying region output and combat.
 - **Record** — achievements, each worth a little of everything, and the one
   thing besides legacy that survives passing the cowl on.
+- **Bounties** — the board opens with the first boss. Three contracts a day,
+  rolled at local midnight and scaled to your numbers when they roll; the
+  rewards are windfalls and go over the ceiling. Filling any one keeps the
+  day streak alive — +1% region per consecutive day up to +10%, kept through
+  passing the cowl on, gone if you skip a day — and clearing all three is
+  ×1.5 region for ten minutes. The tab also holds the **Stakeout**, a timing
+  minigame on a cooldown: start it, watch the marker sweep, move in when it
+  crosses the drop. Inside the window pays leads and funding, dead centre
+  pays triple, a miss pays nothing and comes back sooner.
+- **Flashpoints** — every few minutes of live play, something is happening
+  *right now*: a banner with a twenty-second countdown. Respond in time for
+  a windfall several times the size of a passive event, or read about what
+  you missed in the log. Like events, they never fire while you're away, so
+  leaving a tab open is not a strategy.
+- **Momentum** — chained Patrol taps build a multiplier, +5% a tap up to
+  ×2.5, dropped the moment you stop for a breath. Autopilot never touches
+  it; it's there for hands that want something to do.
 - **Tech** — a four-branch tree. Street makes the region richer and cheaper,
   Body opens the abilities and amplifies the fight, Mind amplifies the powers
   the region runs on and speeds recharge, and Ops unlocks the quality-of-life
@@ -59,8 +76,9 @@ Asserts the things that are easy to break and hard to notice: that a save
 from before crew, storage and projects existed still loads, that income
 stops at the ceiling while windfalls go over it, that unpaid crew leave
 instead of wedging the loop, that offline catch-up can't farm random
-events, and that every tech requirement points at a node that exists. It
-exits non-zero on the first thing that is wrong.
+events or flashpoints, that the bounty board rolls, pays, streaks and
+lapses on the right days, and that every tech requirement points at a
+node that exists. It exits non-zero on the first thing that is wrong.
 
 ## Checking the balance
 

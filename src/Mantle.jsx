@@ -19,6 +19,12 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
  *    POWERS   ranks bought with XP, multiplying region and combat
  *    WORKS    city projects paid for in slices, stacking forever
  *    RECORD   achievements, kept when the cowl changes hands
+ *    BOUNTIES three contracts a day off the board, scaled to your
+ *             numbers when they roll. Filling any one keeps the day
+ *             streak alive; the streak and the stakeout minigame are
+ *             what the board is for
+ *    FLASH    flashpoints: something is happening RIGHT NOW, and a
+ *             button with a countdown says so. Live play only
  *    TECH     a four-branch tree. Street makes the region richer and
  *             cheaper, Body opens the abilities and amplifies the
  *             fight, Mind amplifies the region's powers, and Ops
@@ -206,6 +212,72 @@ const EVENTS = [
   { id: "quiet", boon: { mult: 1.35, dur: 240 }, text: "A quiet night, and everyone gets twice as much done." },
 ];
 
+/* Flashpoints: something is happening RIGHT NOW. A banner with a countdown
+   appears; respond in time and the windfall is far bigger than a passive
+   event, miss it and it goes to the log. Live play only, same as events,
+   so leaving the tab open is never the way to farm them. */
+const FLASHPOINTS = [
+  { id: "alarm", res: "funding",
+    text: "A silent alarm, two blocks over. Nobody else is close.",
+    won: "You beat the response time by a street. The vault stays shut, and the reward doesn't.",
+    miss: "The crew you didn't catch clears the vault in four minutes." },
+  { id: "handoff", res: "salvage",
+    text: "A truck with bad plates is idling at the loading dock.",
+    won: "You take the truck at the light. Everything in the back is evidence, eventually.",
+    miss: "The truck is gone, and the dock foreman saw nothing." },
+  { id: "witness", res: "leads",
+    text: "A witness is willing to talk — right now, and never again.",
+    won: "You listen for an hour. Half the city's secrets fit on one napkin.",
+    miss: "By morning the witness remembers nothing." },
+  { id: "signal", boon: { mult: 2, dur: 90 },
+    text: "The signal is up. The whole city is watching.",
+    won: "You answer the signal, and the whole city gets louder for you.",
+    miss: "The signal burns out over an empty street." },
+];
+
+/* ------------------------- the bounty board ------------------------ *
+ *  Three contracts a day, rolled at local midnight and scaled to your
+ *  numbers when they roll. Rewards are windfalls, allowed over the
+ *  ceiling. Filling any one keeps the day streak alive, and the streak
+ *  is worth region for as long as it holds — the board's whole job is
+ *  to be worth coming back to tomorrow.
+ *    metric   which career counter the contract watches (see METRICS)
+ *    goal     how far that counter has to move from where it was
+ *    pay      which resource the windfall lands in
+ *    show     whether the contract can roll at all right now
+ * ------------------------------------------------------------------ */
+const CONTRACTS = [
+  { id: "sweep", name: "Clean Sweep", metric: "kills", pay: "funding",
+    line: (n) => `Win ${amt(n)} fights, anywhere in the city.`,
+    goal: (s, d) => (d.winnable ? nice(Math.max(10, 480 / d.ttkEff)) : 10),
+    blurb: "The precinct wants the month's numbers to look like a different city." },
+  { id: "ledger", name: "Balance the Ledger", metric: "funding", pay: "salvage",
+    line: (n) => `Bring in ${amt(n)} funding from the region.`,
+    goal: (s, d) => nice(Math.max(150, d.gross.funding * 1200)),
+    show: (s, d) => d.gross.funding > 0,
+    blurb: "Somebody downtown is watching the books and likes what they see." },
+  { id: "casework", name: "Casework", metric: "xp", pay: "funding",
+    line: (n) => `Earn ${amt(n)} XP in the fight.`,
+    goal: (s, d) => nice(Math.max(120, d.xpRate * 900)),
+    show: (s, d) => d.xpRate > 0,
+    blurb: "Every file needs a closing page, and you write those with your fists." },
+  { id: "shoeleather", name: "Shoe Leather", metric: "patrols", pay: "funding",
+    line: (n) => `Patrol ${amt(n)} times by hand. Autopilot doesn't count.`,
+    goal: () => 30,
+    blurb: "Nothing on the scanner replaces walking the blocks yourself." },
+  { id: "merchandise", name: "Move the Merchandise", metric: "traded", pay: "leads",
+    line: (n) => `Move ${amt(n)} funding through the black market.`,
+    goal: (s, d) => nice(Math.max(200, d.caps.funding * 0.15)),
+    show: (s) => !!s.tech.fence,
+    blurb: "The fence wants volume this week and doesn't care whose." },
+  /* fmt is a name, not the function: pct isn't defined yet up here */
+  { id: "cranes", name: "Cranes on the Skyline", metric: "works", pay: "funding", fmt: "pct",
+    line: (n) => `Put ${pct(n)} of a city project up.`,
+    goal: () => 0.25,
+    show: (s) => !!s.tech.projects,
+    blurb: "The city wants to see something rising it didn't pay for." },
+];
+
 /* ---------------------------- the tree ---------------------------- *
  *  branch + tier drive the layout; req drives the wiring.
  *  amp     doubles a power's per-rank value
@@ -311,6 +383,22 @@ const TUNE = {
   marketFloor: 0.25,
   overflowRate: 0.5,      /* Fence Network sells overflow at half price */
   eventEvery: 420,        /* mean seconds between live events */
+  flashEvery: 300,        /* mean seconds between flashpoints */
+  flashWindow: 20,        /* seconds to respond before it's gone */
+  flashRes: 600,          /* a flashpoint pays this many seconds of income... */
+  flashCap: 0.1,          /* ...or this share of the ceiling, whichever is more */
+  momentumStep: 0.05,     /* patrol bonus per chained tap... */
+  momentumCap: 30,        /* ...up to ×2.5 */
+  momentumWindow: 2.5,    /* seconds between taps before the chain drops */
+  stakeoutCd: 120,        /* seconds between stakeouts */
+  stakeoutMissCd: 30,     /* a blown one comes back sooner */
+  stakeoutRes: 240,       /* a clean entry pays this many seconds of income... */
+  stakeoutCap: 0.04,      /* ...or this share of the ceiling; perfect pays ×3 */
+  contractsADay: 3,
+  contractPay: 900,       /* a bounty pays this many seconds of income... */
+  contractCap: 0.15,      /* ...or this share of the ceiling, whichever is more */
+  streakBonus: 0.01,      /* region per day of the streak... */
+  streakCap: 10,          /* ...up to ten days */
   achieveBonus: 0.005,
   logKeep: 40,
   offlineCap: 8 * 3600,
@@ -354,16 +442,22 @@ const freshState = (legacy = 0) => ({
   autosell: {},
   projects: {},
   boon: null,
+  flash: null,
+  patrols: 0,
+  momentum: { n: 0, at: -10 },
+  stakeoutAt: 0,
+  contracts: null,        /* the board; rolled by the wall clock, not game time */
   log: [],
   time: 0,
   totalXP: 0,
   legacy,
   careerFunding: 0,
-  /* these five outlive the career: handing the cowl on keeps them */
+  /* these six outlive the career: handing the cowl on keeps them */
   allTimeFunding: 0,
   achieved: {},
   traded: 0,
   runs: 0,
+  streak: { days: 0, last: 0 },
 });
 
 /* Old saves predate bosses, crew, storage and projects: fill the gaps, and
@@ -379,6 +473,8 @@ function migrate(saved) {
     fight: { ...freshFight(), ...st.fight },
     crew: { ...freshCrew(), ...st.crew, jobs: { ...freshCrew().jobs, ...(st.crew || {}).jobs } },
     market: { ...fresh.market, ...st.market },
+    momentum: { ...fresh.momentum, ...(st.momentum || {}) },
+    streak: { ...fresh.streak, ...(st.streak || {}) },
     autosell: { ...st.autosell },
     projects: { ...st.projects },
     achieved: { ...st.achieved },
@@ -481,12 +577,17 @@ function derive(s, opts = {}) {
 
   const boon = s.boon && s.boon.left > 0 ? s.boon : null;
 
+  /* the day streak off the bounty board; the tick that runs the board
+     lapses it when a day gets skipped */
+  const streakDays = Math.min(TUNE.streakCap, (s.streak && s.streak.days) || 0);
+  const streakMult = 1 + TUNE.streakBonus * streakDays;
+
   const global =
     mult.global * levelMult *
     (1 + TUNE.legacyBonus * s.legacy) *
     (1 + towerEach * s.own.tower) *
     (1 + TUNE.heldBonus * held) *
-    (1 + proj.region) * badgeMult *
+    (1 + proj.region) * badgeMult * streakMult *
     (boon ? boon.mult : 1) *
     (tech.cascade ? 1 + 0.01 * totalRanks : 1);
 
@@ -588,7 +689,7 @@ function derive(s, opts = {}) {
 
   return {
     hero, powers, mult, bMult, cut, level, levelMult, global, gross, totalRanks, towerEach, held,
-    caps, capMult, price, proj, projCd, projDone, badges, badgeMult, boon,
+    caps, capMult, price, proj, projCd, projDone, badges, badgeMult, boon, streakDays, streakMult,
     crew: split, beds, crewMult, crewMakes, crewCombat, crewXP, upkeep,
     patrol, power, resolve, xpMult, fightMult, dist, ttk, ttkEff, damageTaken, winnable, xpRate,
     abilities, auto, cdMult, abilMult, sustain, intake,
@@ -804,6 +905,97 @@ function pour(res, caps, k, n, spill) {
 
 const logged = (list, t, text) => [...list, { t: Math.floor(t), text }].slice(-TUNE.logKeep);
 
+/* ------------------------- the bounty board ------------------------ */
+
+/* Rounds a goal to something a person can hold in their head. */
+const nice = (n) => {
+  const m = Math.pow(10, Math.max(0, Math.floor(Math.log10(Math.max(1, n))) - 1));
+  return Math.max(1, Math.round(n / m) * m);
+};
+
+/* Career counters the contracts watch. All of them only ever go up, so a
+   contract is just "move this number by that much from where it was". */
+const METRICS = {
+  kills: (s) => Object.values(s.cleared).reduce((a, b) => a + b, 0),
+  funding: (s) => s.careerFunding,
+  xp: (s) => s.totalXP,
+  traded: (s) => s.traded,
+  patrols: (s) => s.patrols || 0,
+  works: (s) => PROJECTS.reduce((n, p) => { const a = s.projects[p.id] || {}; return n + (a.done || 0) + (a.prog || 0); }, 0),
+};
+
+const contractById = (id) => CONTRACTS.find((c) => c.id === id);
+
+/* Goals and pays are frozen at roll time, so a contract stays exactly what
+   it said in the morning no matter what you buy in the afternoon. */
+function rollContracts(s, d, day) {
+  const bag = CONTRACTS.filter((c) => !c.show || c.show(s, d));
+  const picks = [];
+  while (picks.length < TUNE.contractsADay && bag.length)
+    picks.push(bag.splice(Math.floor(Math.random() * bag.length), 1)[0]);
+  return {
+    day,
+    list: picks.map((c) => ({
+      id: c.id,
+      base: METRICS[c.metric](s),
+      goal: c.goal(s, d),
+      pay: { [c.pay]: Math.ceil(Math.max(100, d.caps[c.pay] * TUNE.contractCap, d.gross[c.pay] * TUNE.contractPay)) },
+      done: false,
+    })),
+  };
+}
+
+/* One pass over the board: lapse a cold streak, roll at midnight, pay out
+   anything filled. Pure, and driven by the wall clock — the UI calls it
+   once a second with today's number, so `step` stays clock-free and the
+   scripts can drive it with any day they like. Returns null when nothing
+   changed. */
+function contractTick(s, day) {
+  let next = null;
+  const bump = () => next || (next = { ...s });
+  /* a skipped day puts the streak back to zero, wherever you are */
+  if (s.streak && s.streak.days > 0 && day - s.streak.last > 1) {
+    bump().streak = { days: 0, last: 0 };
+    next.log = logged(next.log, s.time, "The streak lapsed. The board doesn't hold grudges; start again.");
+  }
+  /* the board itself only exists once the city has seen you finish a boss */
+  if (!s.hero || !s.bosses.flats) return next;
+  const cs = next || s;
+  if (!cs.contracts || cs.contracts.day !== day || !Array.isArray(cs.contracts.list)) {
+    bump().contracts = rollContracts(cs, derive(cs), day);
+    if (s.contracts) next.log = logged(next.log, s.time, "The board turned over. Three new bounties are up.");
+    return next;
+  }
+  const doneNow = [];
+  const list = cs.contracts.list.map((c) => {
+    if (c.done) return c;
+    const t = contractById(c.id);
+    if (!t || METRICS[t.metric](cs) - c.base + 1e-9 < c.goal) return c;
+    doneNow.push(c);
+    return { ...c, done: true };
+  });
+  if (!doneNow.length) return next;
+  bump();
+  next.contracts = { ...cs.contracts, list };
+  next.res = { ...cs.res };
+  for (const c of doneNow) {
+    for (const k in c.pay) next.res[k] += c.pay[k];
+    next.log = logged(next.log, s.time,
+      `Bounty filled: ${contractById(c.id).name}. ${Object.keys(c.pay).map((k) => `+${amt(c.pay[k])} ${nameOf(k).toLowerCase()}`).join(", ")}.`);
+  }
+  if (((cs.streak || {}).last || 0) !== day) {
+    const days = ((cs.streak || {}).last || 0) === day - 1 ? (cs.streak.days || 0) + 1 : 1;
+    next.streak = { days, last: day };
+    next.log = logged(next.log, s.time,
+      `Day ${days} on the board. +${pct(TUNE.streakBonus * Math.min(TUNE.streakCap, days))} region while the streak holds.`);
+  }
+  if (list.every((c) => c.done)) {
+    next.boon = { id: "board", mult: 1.5, left: 600 };
+    next.log = logged(next.log, s.time, "The board is clear. Word travels: ×1.5 region for ten minutes.");
+  }
+  return next;
+}
+
 function step(s, dt, opts = {}) {
   const d = derive(s, opts);
   const res = { ...s.res };
@@ -917,6 +1109,20 @@ function step(s, dt, opts = {}) {
     }
   }
 
+  /* ---- flashpoints: they run down whatever you do, and only live play
+     rolls a new one. Responding is the player's move (see useGame). ---- */
+  if (s.flash) {
+    const left = s.flash.left - dt;
+    if (left > 0) next.flash = { ...s.flash, left };
+    else {
+      next.flash = null;
+      const fp = FLASHPOINTS.find((f) => f.id === s.flash.id);
+      if (fp) note.push(fp.miss);
+    }
+  } else if (dt <= 5 && !opts.quiet && Math.random() < dt / TUNE.flashEvery) {
+    next.flash = { id: FLASHPOINTS[Math.floor(Math.random() * FLASHPOINTS.length)].id, left: TUNE.flashWindow };
+  }
+
   /* Live-play only: a long offline catch-up runs in slices of minutes, and
      rolling an event per slice would turn leaving into a strategy. */
   if (dt <= 5 && !opts.quiet && Math.random() < dt / TUNE.eventEvery) {
@@ -985,10 +1191,11 @@ const toneOf = (id) => RESOURCES.find((r) => r.id === id)?.tone ?? "plain";
 /* Exposed for the balance script in scripts/. Not used by the UI. */
 export const engine = {
   RESOURCES, HEROES, POWERS, DISTRICTS, ABILITIES, GEAR, TERRITORY, TECH, TUNE,
-  JOBS, PROJECTS, MARKET, ACHIEVEMENTS,
+  JOBS, PROJECTS, MARKET, ACHIEVEMENTS, FLASHPOINTS, CONTRACTS, METRICS,
   freshState, migrate, derive, step, costOf, powerCost, canPay, maxAffordable,
   unlocked, bossReady, forecastBoss, startBoss, bestDistrict, levelOf,
   crewSplit, projectCost, projectMax, projectAt, marketDip,
+  rollContracts, contractTick,
 };
 
 /* ============================ THE HOOK ============================ */
@@ -1021,7 +1228,8 @@ function useGame() {
         if (back.hero && gap > 60) {
           const before = { funding: back.res.funding, xp: back.totalXP };
           const slice = (gap * eff) / 240;
-          for (let i = 0; i < 240; i++) back = step(back, slice);
+          /* quiet: events and flashpoints are for live play, whatever the slice size */
+          for (let i = 0; i < 240; i++) back = step(back, slice, { quiet: true });
           if (!dead) setAway({ gap, funding: back.res.funding - before.funding, xp: back.totalXP - before.xp });
         }
         if (!dead) setS(back);
@@ -1065,6 +1273,17 @@ function useGame() {
       persist();
     };
   }, [ready, persist]);
+
+  /* The bounty board runs on the wall clock, not game time: it rolls at
+     local midnight, pays out what you've filled, and lapses cold streaks. */
+  useEffect(() => {
+    if (!ready) return;
+    const dayNow = () => Math.floor((Date.now() - new Date().getTimezoneOffset() * 60000) / 86400000);
+    const tick = () => setS((p) => contractTick(p, dayNow()) || p);
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [ready]);
 
   const d = derive(s);
 
@@ -1313,14 +1532,75 @@ function useGame() {
   const legacyTip = () =>
     `Left behind by every hero before you. Each point adds ${pct(TUNE.legacyBonus)} to the region and to combat, and never goes away. Passing the cowl is the only way to earn it, and the only thing it doesn't burn.`;
 
+  const boardTip = () =>
+    `Three contracts roll at local midnight, scaled to your numbers when they roll, and they pay windfalls — a bounty can go over the ceiling. ` +
+    `Fill any one and the day streak holds: +${pct(TUNE.streakBonus)} region per day up to +${pct(TUNE.streakBonus * TUNE.streakCap)}, and it survives passing the cowl on. ` +
+    `Clear the whole board for ×1.5 region for ten minutes. Skip a day and the streak goes cold.`;
+
+  const streakTip = () =>
+    `${d.streakDays ? `Day ${s.streak.days} — the region is running ${x(d.streakMult)} off the streak alone.` : `Cold. Fill any bounty today to start it.`} ` +
+    `Each day you fill at least one bounty adds ${pct(TUNE.streakBonus)} region, up to ${pct(TUNE.streakBonus * TUNE.streakCap)}. Miss a whole day and it resets. The streak is one of the few things that outlives the cowl.`;
+
+  const stakeTip = () =>
+    `A timing game. Start the stakeout, watch the marker sweep, and move in when it crosses the drop. ` +
+    `Inside the window pays about ${amt(Math.max(d.caps.leads * TUNE.stakeoutCap, d.gross.leads * TUNE.stakeoutRes))} leads and ${amt(Math.max(d.caps.funding * TUNE.stakeoutCap, d.gross.funding * TUNE.stakeoutRes))} funding; dead centre pays triple. ` +
+    `Blow it and nothing but the wait. Another handoff every ${TUNE.stakeoutCd}s, sooner after a miss.`;
+
   /* ---- actions ---- */
   const choose = (id) => setS((p) => ({ ...p, hero: id }));
   const setDistrict = (id) => setS((p) => (p.district === id ? p : { ...p, district: id, fight: freshFight() }));
 
+  /* Chained taps build momentum: +5% a tap up to ×2.5, dropped the moment
+     you stop for a breath. Autopilot patrols never touch it. */
   const patrol = () =>
     setS((p) => {
-      const gain = derive(p).patrol;
-      return { ...p, res: { ...p.res, leads: p.res.leads + gain, salvage: p.res.salvage + gain } };
+      const m = p.momentum || { n: 0, at: -10 };
+      const n = p.time - m.at <= TUNE.momentumWindow ? Math.min(m.n + 1, TUNE.momentumCap) : 0;
+      const gain = derive(p).patrol * (1 + TUNE.momentumStep * n);
+      return {
+        ...p,
+        patrols: (p.patrols || 0) + 1,
+        momentum: { n, at: p.time },
+        res: { ...p.res, leads: p.res.leads + gain, salvage: p.res.salvage + gain },
+      };
+    });
+
+  /* Answering a flashpoint before the clock runs out. The windfall is
+     allowed over the ceiling, like everything else you actually won. */
+  const respond = () =>
+    setS((p) => {
+      if (!p.flash) return p;
+      const fp = FLASHPOINTS.find((f) => f.id === p.flash.id);
+      if (!fp) return { ...p, flash: null };
+      if (fp.boon)
+        return { ...p, flash: null, boon: { id: fp.id, mult: fp.boon.mult, left: fp.boon.dur },
+          log: logged(p.log, p.time, `${fp.won} ×${fp.boon.mult} region for ${fp.boon.dur}s.`) };
+      const dd = derive(p);
+      const gain = Math.max(dd.caps[fp.res] * TUNE.flashCap, dd.gross[fp.res] * TUNE.flashRes);
+      return { ...p, flash: null, res: { ...p.res, [fp.res]: p.res[fp.res] + gain },
+        log: logged(p.log, p.time, `${fp.won} +${amt(gain)} ${nameOf(fp.res).toLowerCase()}.`) };
+    });
+
+  /* The stakeout resolves in the UI (it's a timing game); this is only the
+     payout. Perfect pays triple, a miss pays nothing and comes back sooner. */
+  const stakeout = (quality) =>
+    setS((p) => {
+      if (p.time < (p.stakeoutAt || 0)) return p;
+      if (quality === "miss")
+        return { ...p, stakeoutAt: p.time + TUNE.stakeoutMissCd,
+          log: logged(p.log, p.time, "Stakeout blown: a bottle rolls off a dumpster and everyone scatters.") };
+      const dd = derive(p);
+      const mult = quality === "perfect" ? 3 : 1;
+      const leads = Math.max(dd.caps.leads * TUNE.stakeoutCap, dd.gross.leads * TUNE.stakeoutRes) * mult;
+      const funding = Math.max(dd.caps.funding * TUNE.stakeoutCap, dd.gross.funding * TUNE.stakeoutRes) * mult;
+      return {
+        ...p,
+        stakeoutAt: p.time + TUNE.stakeoutCd,
+        res: { ...p.res, leads: p.res.leads + leads, funding: p.res.funding + funding },
+        log: logged(p.log, p.time, quality === "perfect"
+          ? `You were already inside when the handoff happened. +${amt(leads)} leads, +${amt(funding)} funding.`
+          : `You move in a beat late, but most of it is still on the table. +${amt(leads)} leads, +${amt(funding)} funding.`),
+      };
     });
 
   const cast = (id) =>
@@ -1474,6 +1754,7 @@ function useGame() {
       achieved: p.achieved,
       traded: p.traded,
       runs: (p.runs || 0) + 1,
+      streak: p.streak,
       log: logged(p.log, 0, `The cowl changes hands. +${gain} legacy carried into the next one.`),
     }));
     setArmed(null);
@@ -1527,6 +1808,7 @@ function useGame() {
   const bossUp = bossReady(s, d.dist) && !s.fight.boss;
   const todo = {
     fight: bossUp ? "boss" : shownGear.filter((gi) => priceGear(gi).ok).length,
+    bounties: s.contracts && Array.isArray(s.contracts.list) ? s.contracts.list.filter((c) => !c.done).length : 0,
     region: d.full.length ? "!" : shownTerritory.filter((t) => priceTerr(t).ok).length,
     crew: d.crew.idle,
     powers: d.powers.filter((p) => canPay(powerCost(p, s.ranks[p.id] || 0, d.cut.rank), s.res)).length,
@@ -1535,10 +1817,11 @@ function useGame() {
     legacy: 0,
   };
 
-  /* tabs earn their place: crew appears with the first safehouse, projects
-     with the tech that opens them */
+  /* tabs earn their place: bounties with the first boss, crew with the
+     first safehouse, projects with the tech that opens them */
   const tabs = [
     ["fight", "Fight"],
+    ...(s.bosses.flats ? [["bounties", "Bounties"]] : []),
     ["region", "Region"],
     ...(s.own.safehouse > 0 ? [["crew", "Crew"]] : []),
     ["powers", "Powers"],
@@ -1553,7 +1836,8 @@ function useGame() {
     away, setAway, news, setNews, armed, setArmed, saveNote, tip, setTip, tipProps, hoverTip, TIP_W,
     resTip, levelTip, heroTip, fightTip, distTip, bossTip, abilityTip, abilitiesTip, gearTip, terrTip, powerTip,
     techTip, techEffect, queueTip, legacyTip, etaLabel, storageTip, crewTip, jobTip, marketTip, projectTip, achieveTip,
-    choose, setDistrict, patrol, cast, challenge, retreat, claim, equip, train, research, handOver, wipe,
+    boardTip, streakTip, stakeTip,
+    choose, setDistrict, patrol, respond, stakeout, cast, challenge, retreat, claim, equip, train, research, handOver, wipe,
     assign, spreadCrew, clearCrew, sell, acquire, toggleSell, fund,
     projectPrice: (pr, share) => projectCost(pr, projectAt(s, pr).done, share, d.cut.tech),
     projectAt: (pr) => projectAt(s, pr),
@@ -2022,6 +2306,142 @@ function Works({ g }) {
   );
 }
 
+/* The stakeout: a timing bar. Start it, watch the marker sweep, move in
+   when it crosses the drop. Dead centre pays triple; a miss pays nothing.
+   The sweep runs on requestAnimationFrame so it's smoother than the game
+   tick; only the payout goes through the engine. */
+function Stakeout({ g }) {
+  const { s, d } = g;
+  const wait = Math.max(0, (s.stakeoutAt || 0) - s.time);
+  const ready = wait <= 0;
+  const [run, setRun] = useState(null); /* { t0, zone } — zone is the drop's centre, 0..1 */
+  const [pos, setPos] = useState(0);
+  const posRef = useRef(0);
+  const [word, setWord] = useState(null);
+
+  useEffect(() => {
+    if (!run) return;
+    let id;
+    const loop = () => {
+      const t = (performance.now() - run.t0) / 1000;
+      if (t > 12) { setRun(null); setWord("You wait too long, and the moment waits for nobody."); g.stakeout("miss"); return; }
+      const p2 = (t % 1.8) / 0.9;
+      const p = p2 < 1 ? p2 : 2 - p2;
+      posRef.current = p;
+      setPos(p);
+      id = requestAnimationFrame(loop);
+    };
+    id = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(id);
+  }, [run]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const start = () => {
+    if (!ready) return;
+    setWord(null);
+    setRun({ t0: performance.now(), zone: 0.22 + Math.random() * 0.56 });
+  };
+  const moveIn = () => {
+    if (!run) return;
+    const off = Math.abs(posRef.current - run.zone);
+    const quality = off <= 0.03 ? "perfect" : off <= 0.09 ? "hit" : "miss";
+    setRun(null);
+    setWord(quality === "perfect" ? "Dead centre. Triple." : quality === "hit" ? "Close enough to count." : "Blown. Everyone scatters.");
+    g.stakeout(quality);
+  };
+
+  return (
+    <div className="n-item flat n-stake">
+      <div className="n-item-top">
+        <span className="n-name">The Handoff</span>
+        <span className="n-top-right">
+          {!ready && <span className="n-count">{secs(wait)}</span>}
+          <button className="n-info" {...g.tipProps("stake", "Stakeout", g.stakeTip())}>?</button>
+        </span>
+      </div>
+      {run ? (
+        <>
+          <div className="n-stake-bar">
+            <span className="n-stake-zone" style={{ left: pct(run.zone - 0.09), width: pct(0.18) }} />
+            <span className="n-stake-perfect" style={{ left: pct(run.zone - 0.03), width: pct(0.06) }} />
+            <span className="n-stake-mark" style={{ left: pct(pos) }} />
+          </div>
+          <div className="n-item-bot">
+            <span className="n-sub">the drop is marked · dead centre pays ×3</span>
+            <button className="n-mode n-stake-go" onClick={moveIn}>Move in</button>
+          </div>
+        </>
+      ) : (
+        <div className="n-item-bot">
+          <span className="n-sub">
+            {word || `Word is a handoff is going down nearby. Worth about ${amt(Math.max(d.caps.leads * TUNE.stakeoutCap, d.gross.leads * TUNE.stakeoutRes))} leads and ${amt(Math.max(d.caps.funding * TUNE.stakeoutCap, d.gross.funding * TUNE.stakeoutRes))} funding.`}
+          </span>
+          <button className="n-mode n-stake-go" disabled={!ready} onClick={start}>
+            {ready ? "Start the stakeout" : `next in ${secs(wait)}`}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* The bounty board: three contracts a day, the streak for coming back
+   tomorrow, and the stakeout for hands between fights. */
+function Bounties({ g }) {
+  const { s, d } = g;
+  const list = (s.contracts && s.contracts.list) || [];
+  return (
+    <>
+      <Section label="Bounty Board" sub="three a day · the board turns over at midnight" g={g} />
+      <Slab
+        flat
+        label="Day Streak"
+        count={d.streakDays || (s.streak || {}).days || 0}
+        countLabel={d.streakDays ? `day ${(s.streak || {}).days}` : "cold"}
+        sub={
+          d.streakDays
+            ? `+${pct(TUNE.streakBonus * d.streakDays)} region while it holds · fill any bounty each day to keep it`
+            : `Fill any bounty today and every day after: +${pct(TUNE.streakBonus)} region a day, up to +${pct(TUNE.streakBonus * TUNE.streakCap)}.`
+        }
+        res={s.res}
+        ok
+        tip={g.tipProps("streak", "Day streak", g.streakTip())}
+      />
+      <p className="n-note">
+        <button className="n-key tip-host" {...g.tipProps("board", "The board", g.boardTip())}>
+          Rewards are windfalls — they can go over the ceiling. Clear all three for ×1.5 region for ten minutes.
+        </button>
+      </p>
+      <div className="n-list">
+        {list.map((c) => {
+          const t = contractById(c.id);
+          if (!t) return null;
+          const show = t.fmt === "pct" ? pct : amt;
+          const have = Math.max(0, Math.min(c.goal, METRICS[t.metric](s) - c.base));
+          return (
+            <div className={"n-item flat n-work" + (c.done ? " n-filled" : "")} key={c.id}>
+              <div className="n-item-top">
+                <span className="n-name">{t.name}</span>
+                <span className="n-top-right">
+                  <span className="n-count">{c.done ? "filled" : `${show(have)}/${show(c.goal)}`}</span>
+                  <button className="n-info" {...g.tipProps("c-" + c.id, t.name, `${t.blurb} ${t.line(c.goal)} Pays ${Object.keys(c.pay).map((k) => `${amt(c.pay[k])} ${nameOf(k).toLowerCase()}`).join(", ")}, over the ceiling if it has to.`)}>?</button>
+                </span>
+              </div>
+              <p className="n-node-eff">{c.done ? t.blurb : t.line(c.goal)}</p>
+              <div className="n-track work"><div className="n-fill" style={{ width: pct(c.done ? 1 : have / c.goal) }} /></div>
+              <div className="n-item-bot">
+                <span className="n-sub">{c.done ? "paid out" : "pays"}</span>
+                <span className="n-price"><Price cost={c.pay} res={c.pay} /></span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <Section label="Stakeout" sub="wait for the handoff · move in on the mark" g={g} />
+      <Stakeout g={g} />
+    </>
+  );
+}
+
 /* A rolling record of everything the city did while you were looking elsewhere. */
 function Log({ g }) {
   const [open, setOpen] = useState(false);
@@ -2200,12 +2620,26 @@ export default function Mantle() {
               <button className="n-x" onClick={() => g.setNews(null)}>OK</button>
             </div>
           )}
+          {s.flash && (() => {
+            const fp = FLASHPOINTS.find((f) => f.id === s.flash.id);
+            return fp ? (
+              <div className="n-flash urgent">
+                <span>{fp.text}</span>
+                <span className="n-flash-act">
+                  <span className="n-flash-t">{Math.ceil(s.flash.left)}s</span>
+                  <button className="n-x go" onClick={g.respond}>Respond</button>
+                </span>
+              </div>
+            ) : null;
+          })()}
 
           <Log g={g} />
 
           {(g.tab === "region" || g.tab === "fight") && <Queue g={g} />}
 
           {g.tab === "fight" && <Fight g={g} />}
+
+          {g.tab === "bounties" && <Bounties g={g} />}
 
           {g.tab === "region" && (
             <>
@@ -2341,6 +2775,9 @@ export default function Mantle() {
           +{amt(d.patrol)} leads, +{amt(d.patrol)} salvage
           {s.tech.autopilot && ` · autopilot ${TUNE.autopilotRate}/s`}
         </span>
+        {s.momentum && s.momentum.n > 0 && s.time - s.momentum.at <= TUNE.momentumWindow && (
+          <span className="n-momentum">momentum ×{(1 + TUNE.momentumStep * s.momentum.n).toFixed(2)}</span>
+        )}
       </button>
 
       {g.tip && (
@@ -2540,6 +2977,14 @@ const CSS = `
   padding: 6px 9px; margin-bottom: 10px; font-size: 11.5px; font-weight: 700;
 }
 .n-x { background: var(--ink); color: #fff; border: none; padding: 2px 9px; font-size: 11px; font-weight: 700; flex-shrink: 0; }
+
+/* ---- flashpoints: the banner that doesn't wait ---- */
+.n-flash.urgent { background: var(--red); color: #fff; animation: n-throb 1s ease-in-out infinite; }
+.n-flash-act { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.n-flash-t { font-variant-numeric: tabular-nums; opacity: .85; font-size: 11px; }
+.n-x.go { background: var(--yellow); color: var(--ink); }
+.n-x.go:hover { background: #ffd04d; }
+@keyframes n-throb { 50% { box-shadow: 2px 2px 0 var(--ink), 0 0 0 4px rgba(232,64,42,.3); } }
 .n-note { font-size: 11.5px; opacity: .72; margin: 0 0 10px; max-width: 64ch; }
 .n-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 16px; padding-top: 10px; border-top: 1.5px solid var(--rule); font-size: 11px; opacity: .75; }
 .n-ghost { background: #fff; border: 1.5px solid var(--ink); padding: 2px 10px; font-size: 11px; font-weight: 700; }
@@ -2616,6 +3061,17 @@ const CSS = `
 .n-log-line { margin: 0; font-size: 10.5px; opacity: .8; line-height: 1.35; }
 .n-log:not(.open) .n-log-line { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .n-log-t { display: inline-block; min-width: 42px; padding-right: 7px; opacity: .45; font-variant-numeric: tabular-nums; }
+/* ---- the bounty board & the stakeout ---- */
+.n-filled { border-style: dashed; opacity: .75; }
+.n-filled .n-count { background: var(--yellow); color: var(--ink); }
+.n-stake-bar { position: relative; height: 26px; border: 2px solid var(--ink); background: rgba(23,22,20,.08); margin: 8px 0 2px; }
+.n-stake-zone { position: absolute; top: 0; bottom: 0; background: var(--yellow); opacity: .6; }
+.n-stake-perfect { position: absolute; top: 0; bottom: 0; background: var(--red); opacity: .85; }
+.n-stake-mark { position: absolute; top: -3px; bottom: -3px; width: 3px; margin-left: -1.5px; background: var(--ink); }
+.n-stake .n-item-bot { margin-top: 6px; }
+.n-stake-go { background: var(--yellow); }
+.n-stake-go:hover:not(:disabled) { background: #ffd04d; }
+
 .n-badges { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 5px; margin-bottom: 10px; }
 .n-badge-card { border: 1.5px dashed var(--ink); padding: 3px 7px 4px; font-size: 10px; opacity: .5; line-height: 1.3; }
 .n-badge-card b { display: block; font-family: var(--head); font-size: 12px; letter-spacing: .03em; text-transform: uppercase; font-weight: 400; }
@@ -2631,6 +3087,11 @@ const CSS = `
 .n-patrol:hover { background: #ffd04d; }
 .n-patrol:active { background: #f0b51e; }
 .n-patrol-sub { opacity: .68; font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; font-weight: 700; letter-spacing: 0; text-transform: none; }
+.n-momentum {
+  margin-left: auto; background: var(--ink); color: var(--yellow);
+  font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; font-weight: 700; letter-spacing: 0; text-transform: none;
+  padding: 1px 7px; font-variant-numeric: tabular-nums;
+}
 
 /* ---- tooltips ---- */
 .n .tip-host { background: none; border: none; padding: 0; margin: 0; font: inherit; color: inherit; text-align: inherit; cursor: help; border-bottom: 1px dotted currentColor; }
@@ -2662,5 +3123,5 @@ const CSS = `
   .n-sec-s { display: none; }
   .n-queue-empty { display: none; }
 }
-@media (prefers-reduced-motion: reduce) { .n * { transition: none !important; } }
+@media (prefers-reduced-motion: reduce) { .n * { transition: none !important; animation: none !important; } }
 `;

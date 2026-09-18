@@ -67,7 +67,39 @@ ok("a 10% slice costs a tenth of the whole", Math.abs(E.projectCost(pr, 0, 0.1).
 const most = E.projectMax(w, pr, 1);
 ok("projectMax stays inside what is left", most > 0 && most <= 1, "max " + most.toFixed(3));
 
-/* 6. every tech, job and project id is sane and reachable */
+/* 6. flashpoints: quiet play never rolls one, and a live one expires */
+let fq = { ...E.migrate(null), hero: "grayline" };
+for (let t = 0; t < 3600; t++) fq = E.step(fq, 1, { quiet: true });
+ok("quiet play never rolls a flashpoint", !fq.flash);
+let fl = { ...E.migrate(null), hero: "grayline", flash: { id: "alarm", left: 5 } };
+fl = E.step(fl, 30, { quiet: true });
+ok("a flashpoint expires on its own", !fl.flash);
+ok("the miss makes the log", fl.log.some((l) => /vault/i.test(l.text)), JSON.stringify(fl.log));
+
+/* 7. the bounty board: rolls, pays, streaks, and turns over at midnight */
+let b = { ...E.migrate(null), hero: "grayline", bosses: { flats: true } };
+b = E.contractTick(b, 1000) || b;
+ok("the board rolls three contracts", b.contracts && b.contracts.day === 1000 && b.contracts.list.length === 3, JSON.stringify(b.contracts));
+ok("contract ids are distinct", new Set(b.contracts.list.map((c) => c.id)).size === b.contracts.list.length);
+ok("goals and pays are positive", b.contracts.list.every((c) => c.goal > 0 && Object.values(c.pay).every((v) => v > 0)));
+ok("a fresh board changes nothing on the next tick", E.contractTick(b, 1000) === null);
+b.contracts.list[0] = { id: "shoeleather", base: b.patrols || 0, goal: 5, pay: { funding: 777 }, done: false };
+b.patrols = (b.patrols || 0) + 5;
+const fundedBefore = b.res.funding;
+b = E.contractTick(b, 1000) || b;
+ok("a filled bounty pays out over the ceiling", b.contracts.list[0].done && b.res.funding - fundedBefore >= 777, `+${b.res.funding - fundedBefore}`);
+ok("filling anything starts the streak", b.streak.days === 1 && b.streak.last === 1000, JSON.stringify(b.streak));
+const g0 = E.derive({ ...b, streak: { days: 0, last: 0 } }).global;
+const g5 = E.derive({ ...b, streak: { days: 5, last: 1000 } }).global;
+ok("the streak is worth region", g5 > g0, `${g0} vs ${g5}`);
+const b2 = E.contractTick(b, 1001) || b;
+ok("midnight turns the board over", b2.contracts.day === 1001 && b2.contracts.list.every((c) => !c.done));
+const b3 = E.contractTick(b, 1002) || b;
+ok("a skipped day lapses the streak", b3.streak.days === 0, "days " + b3.streak.days);
+for (const c of E.CONTRACTS) ok("contract metric exists: " + c.id, typeof E.METRICS[c.metric] === "function");
+for (const k in E.METRICS) ok("metric is finite on a fresh save: " + k, Number.isFinite(E.METRICS[k](E.freshState())));
+
+/* 8. every tech, job and project id is sane and reachable */
 const ids = new Set();
 for (const t of E.TECH) { ok("tech id unique: " + t.id, !ids.has(t.id)); ids.add(t.id); }
 for (const t of E.TECH) for (const r of t.req) ok(`${t.id} requires a real node`, ids.has(r), r);
