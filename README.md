@@ -70,6 +70,21 @@ A superhero incremental game: pick a hero, hold a city, get stronger.
   auto-fire (Reflex Triggers), auto-climb (Threat Assessment, which also takes
   bosses on when the forecast says they're won), overflow selling and longer
   offline time.
+- **Settings** — the gear at the end of the tab bar, and a link at the foot
+  of Legacy. It holds the save itself: the career as a `MANTLE1:` code to
+  copy or download, a box to paste one back into, a manual save, and the
+  two ways out — starting the career over by hand, or erasing the save
+  outright. The rest is comfort: how the big numbers read (12.3M or
+  1.23e7), how often the game saves, the headline ticker, animations, and
+  whether 1–4 fire abilities. Comfort switches are kept on the browser
+  rather than in the save, so an import or a wipe never costs you them.
+- **Starting over** — a do-over, not a prestige. The career goes back to
+  hero select and pays nothing for it: legacy, keepsakes, the record and
+  the day streak carry because they outlive a career anyway, and today's
+  bounty board comes with it so a restart can't roll a second slate and be
+  paid twice for the same day. Passing the cowl on is still the only thing
+  that earns legacy, and still the better way out of a run you can afford
+  to finish.
 
 ## Running it
 
@@ -94,9 +109,11 @@ the ceiling while windfalls go over it, that unpaid crew leave instead of
 wedging the loop, that a long catch-up keeps the kills it is owed, that
 offline catch-up can't farm random events or flashpoints, that the bounty
 board rolls, pays, streaks and lapses on the right days, that ownership
-marks land on producers only, that keepsakes apply and stack, and that
-every tech requirement points at a node that exists. It exits non-zero on
-the first thing that is wrong.
+marks land on producers only, that keepsakes apply and stack, that
+every tech requirement points at a node that exists, that an exported save
+code round-trips a career down to the em dashes in its log, and that junk
+pasted into the import box is refused instead of loading as an empty
+career. It exits non-zero on the first thing that is wrong.
 
 ```
 npm run test:ui
@@ -105,11 +122,13 @@ npm run test:ui
 Builds the site and drives it in a real Chromium (`scripts/uitest.mjs`):
 the flashpoint banner pays and clears, patrol momentum shows, the board
 and streak render, a stakeout round resolves to a cooldown, a producer
-prints its next mark, and the estate rite hands a keepsake to a brand-new
-career that survives the reset. It seeds saves through `localStorage`
-before boot, starts and stops its own preview server, and fails on any
-uncaught page error. Set `CHROMIUM_PATH` if Playwright can't find a
-browser of its own.
+prints its next mark, the settings panel hands out a save code, refuses a
+bad one, imports a good one over the career in front of it and starts a
+career over, its switches survive a reload, and the estate rite hands a
+keepsake to a brand-new career that survives the reset. It seeds saves
+through `localStorage` before boot, starts and stops its own preview
+server, and fails on any uncaught page error. Set `CHROMIUM_PATH` if
+Playwright can't find a browser of its own.
 
 ## Checking the balance
 
@@ -139,7 +158,8 @@ promise, but if it can't beat a boss nobody can.
 - `scripts/sanity.mjs` — the engine assertions above.
 - `scripts/uitest.mjs` — the browser checks above.
 
-Progress saves every 10 seconds and when the tab is hidden. Offline progress is
+Progress saves every 10 seconds — 30 or 60 instead, if you'd rather, in
+Settings — and when the tab is hidden. Offline progress is
 credited on load, capped at 8 hours (24 with the Archive tech) and capped again
 by your storage — a lockup or two is worth more overnight than another perch.
 Random events only fire during live play, so leaving is never the better way to
@@ -151,6 +171,15 @@ enough lockups to hold what they already produce, so nobody comes back to a full
 city and no way to empty it. A save that is damaged rather than merely old is
 scrubbed to sane numbers on the way in, and one that still won't parse is parked
 under `mantle:hero:v3:rescue` instead of being overwritten by the next autosave.
+
+An imported code comes in through the same door: the same migration, the same
+scrubbing, and a refusal rather than a load for anything that isn't a save — an
+empty object would otherwise import as a brand-new career, which is a wipe
+wearing an import's clothes. An import is written to storage immediately, so a
+tab closed a second later doesn't come back to the career it just replaced, and
+nothing is credited for the trip: a save resumes where it left off rather than
+paying out the hours since it was exported. The comfort switches live under
+`mantle:hero:v3:prefs`, apart from the save.
 
 ## Deploying
 

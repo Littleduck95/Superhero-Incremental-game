@@ -1307,7 +1307,20 @@ function catchUp(s0, gap) {
 
 const SUFFIX = ["", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp"];
 
+/* How the big numbers read. It is a display preference, so it sits with
+   the formatters rather than in the save: they are pure functions called
+   from every corner of the UI, and threading a setting through all of
+   them would be worse than one module-level switch. */
+let NUM_STYLE = "short";
+const setNumStyle = (v) => { NUM_STYLE = v === "sci" ? "sci" : "short"; };
+
 function abbreviate(n) {
+  if (NUM_STYLE === "sci" && n >= 1000) {
+    let e = Math.floor(Math.log10(n));
+    let m = n / Math.pow(10, e);
+    if (m >= 10) { m /= 10; e += 1; } /* 999999.99 would print as 10.00e5 */
+    return m.toFixed(2) + "e" + e;
+  }
   let i = 0;
   while (n >= 1000 && i < SUFFIX.length - 1) { n /= 1000; i++; }
   return (n < 10 ? n.toFixed(2) : n < 100 ? n.toFixed(1) : n.toFixed(0)) + SUFFIX[i];
@@ -1338,6 +1351,78 @@ const pct = (n) => (Math.abs(n) < 0.01 && n !== 0 ? (n * 100).toFixed(1) : (n * 
 const nameOf = (id) => RESOURCES.find((r) => r.id === id)?.name ?? id;
 const toneOf = (id) => RESOURCES.find((r) => r.id === id)?.tone ?? "plain";
 
+/* --------------------------- save data ---------------------------- *
+   Export hands the player a code to mail to themselves; import takes it
+   back. It is base64 so a stray line break in a chat window can't
+   quietly corrupt a brace, tagged so it is obvious what it is, and the
+   reader also takes raw JSON, because somebody will always paste the
+   contents of their browser storage instead. */
+
+const SAVE_TAG = "MANTLE1:";
+
+const toB64 = (str) => {
+  const bytes = new TextEncoder().encode(str);
+  let bin = "";
+  /* chunked: spreading a long save into one call blows the stack */
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+};
+
+const fromB64 = (code) => {
+  const bin = atob(code.replace(/\s+/g, ""));
+  return new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+};
+
+const encodeSave = (state, at = Date.now()) => SAVE_TAG + toB64(JSON.stringify({ at, state }));
+
+/* Enough of a save to be worth loading. An empty object parses fine and
+   would migrate into a brand-new career, which is a wipe wearing an
+   import's clothes, so ask for something every real save has. */
+const looksLikeSave = (st) =>
+  !!st && typeof st === "object" && !Array.isArray(st) &&
+  (typeof st.hero === "string" || (!!st.res && typeof st.res === "object") || (!!st.own && typeof st.own === "object"));
+
+/* Reads anything that might be a save — the tagged code, bare base64, or
+   the JSON envelope the game stores — and hands back a state, scrubbed
+   by the same migration a loaded save goes through. Returns null rather
+   than half a career: the caller either gets a game or gets told it
+   wasn't one. */
+function parseSave(text) {
+  const raw = String(text == null ? "" : text).trim();
+  if (!raw) return null;
+  const bodies = [raw];
+  try { bodies.unshift(fromB64(raw.startsWith(SAVE_TAG) ? raw.slice(SAVE_TAG.length) : raw)); } catch { /* not base64, then */ }
+  for (const body of bodies) {
+    let parsed = null;
+    try { parsed = JSON.parse(body); } catch { continue; }
+    if (!parsed || typeof parsed !== "object") continue;
+    const st = looksLikeSave(parsed.state) ? parsed.state : parsed;
+    if (!looksLikeSave(st)) continue;
+    return migrate(st);
+  }
+  return null;
+}
+
+/* -------------------------- preferences --------------------------- *
+   About the screen rather than the city, so they are kept under their
+   own key: an import replaces a career without touching how it reads,
+   and erasing the save leaves the switches where you set them. */
+
+const PREFS_KEY = TUNE.saveKey + ":prefs";
+const AUTOSAVES = [10, 30, 60];
+const DEFAULT_PREFS = { numbers: "short", autosave: 10, ticker: true, motion: true, hotkeys: true };
+
+const cleanPrefs = (raw) => {
+  const p = raw && typeof raw === "object" ? raw : {};
+  return {
+    numbers: p.numbers === "sci" ? "sci" : "short",
+    autosave: AUTOSAVES.includes(p.autosave) ? p.autosave : DEFAULT_PREFS.autosave,
+    ticker: p.ticker !== false,
+    motion: p.motion !== false,
+    hotkeys: p.hotkeys !== false,
+  };
+};
+
 /* Exposed for the balance script in scripts/. Not used by the UI. */
 export const engine = {
   RESOURCES, HEROES, POWERS, DISTRICTS, ABILITIES, GEAR, TERRITORY, TECH, TUNE,
@@ -1346,6 +1431,7 @@ export const engine = {
   unlocked, bossReady, forecastBoss, startBoss, bestDistrict, levelOf,
   crewSplit, projectCost, projectMax, projectAt, marketDip,
   rollContracts, contractTick, settleBoard, windfall, mergeBoon, catchUp, msCrossed, msNext,
+  encodeSave, parseSave, cleanPrefs, DEFAULT_PREFS,
 };
 
 /* ============================ THE HOOK ============================ */
@@ -1362,13 +1448,28 @@ function useGame() {
   const [rite, setRite] = useState(null); /* the keepsake choice mid-prestige */
   const [saveNote, setSaveNote] = useState("");
   const [tip, setTip] = useState(null);
+  const [prefs, setPrefs] = useState(DEFAULT_PREFS);
+  const [settings, setSettings] = useState(false);
+  const [settingsNote, setSettingsNote] = useState("");
 
   const live = useRef(s);
   live.current = s;
+  const prefsRef = useRef(prefs);
+  prefsRef.current = prefs;
+
+  /* the formatters are module-level, so the choice is handed to them
+     before anything that renders a number */
+  setNumStyle(prefs.numbers);
 
   useEffect(() => {
     let dead = false;
     (async () => {
+      try {
+        const kept = cleanPrefs(JSON.parse((await window.storage.get(PREFS_KEY)).value));
+        if (!dead) setPrefs(kept);
+      } catch {
+        /* never set, unreadable, or storage unavailable: the defaults hold */
+      }
       let raw = null;
       try {
         raw = (await window.storage.get(TUNE.saveKey)).value;
@@ -1423,18 +1524,21 @@ function useGame() {
     return () => clearInterval(id);
   }, [ready]);
 
-  const persist = useCallback(async () => {
+  const writeSave = useCallback(async (state) => {
     try {
-      await window.storage.set(TUNE.saveKey, JSON.stringify({ at: Date.now(), state: live.current }));
+      await window.storage.set(TUNE.saveKey, JSON.stringify({ at: Date.now(), state }));
       setSaveNote("saved " + new Date().toLocaleTimeString());
+      return true;
     } catch {
       setSaveNote("this session can't save progress");
+      return false;
     }
   }, []);
+  const persist = useCallback(() => writeSave(live.current), [writeSave]);
 
   useEffect(() => {
     if (!ready) return;
-    const id = setInterval(persist, 10000);
+    const id = setInterval(persist, prefs.autosave * 1000);
     const onHide = () => document.visibilityState === "hidden" && persist();
     document.addEventListener("visibilitychange", onHide);
     return () => {
@@ -1442,7 +1546,7 @@ function useGame() {
       document.removeEventListener("visibilitychange", onHide);
       persist();
     };
-  }, [ready, persist]);
+  }, [ready, persist, prefs.autosave]);
 
   /* The bounty board runs on the wall clock, not game time: it rolls at
      local midnight, pays out what you've filled, and lapses cold streaks. */
@@ -1803,15 +1907,30 @@ function useGame() {
 
   /* 1–4 fire abilities from the keyboard on the fight tab */
   useEffect(() => {
-    if (!ready || tab !== "fight") return;
+    if (!ready || tab !== "fight" || !prefs.hotkeys || settings) return;
     const onKey = (e) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
+      /* never out from under someone typing a save code into a box */
+      const el = e.target;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) return;
       const a = ABILITIES.find((a) => a.key === e.key);
       if (a) cast(a.id);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [ready, tab]);
+  }, [ready, tab, prefs.hotkeys, settings]);
+
+  /* Escape closes the settings panel, like the tooltips */
+  useEffect(() => {
+    if (!settings) return;
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      setSettings(false);
+      setArmed(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [settings]);
 
   const buyFrom = (key, which) => (item) =>
     setS((p) => {
@@ -1979,9 +2098,110 @@ function useGame() {
   const wipe = async () => {
     try { await window.storage.delete(TUNE.saveKey); } catch { /* nothing stored */ }
     setS(freshState());
-    setArmed(null);
+    setAway(null); setNews(null); setRite(null); setArmed(null);
+    setSettings(false);
     setTab("fight");
   };
+
+  /* ---- settings, and the save itself ---- */
+
+  /* Preferences are written the moment they are flipped: nobody expects
+     to have to come back and save a switch. */
+  const setPref = useCallback((k, v) => {
+    const next = cleanPrefs({ ...prefsRef.current, [k]: v });
+    setPrefs(next);
+    (async () => {
+      try { await window.storage.set(PREFS_KEY, JSON.stringify(next)); } catch { /* storage unavailable */ }
+    })();
+  }, []);
+
+  const openSettings = () => { setArmed(null); setSettingsNote(""); setSettings(true); };
+  const closeSettings = () => { setArmed(null); setSettings(false); };
+
+  /* The live career, not the last autosave: a code is worth nothing if
+     it is ten seconds behind what the player is looking at. */
+  const exportSave = () => encodeSave(live.current);
+
+  const copySave = async (code = exportSave()) => {
+    try {
+      await navigator.clipboard.writeText(code);
+      setSettingsNote("Code copied.");
+      return true;
+    } catch {
+      /* clipboard access is denied on plain http and in some browsers */
+      setSettingsNote("This browser won't let the page copy for you — select the code and copy it yourself.");
+      return false;
+    }
+  };
+
+  const downloadSave = (code = exportSave()) => {
+    try {
+      const url = URL.createObjectURL(new Blob([code], { type: "text/plain" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `mantle-save-${new Date().toISOString().slice(0, 10)}.txt`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      setSettingsNote("Save written to a file.");
+      return true;
+    } catch {
+      setSettingsNote("This browser wouldn't hand over a file — copy the code instead.");
+      return false;
+    }
+  };
+
+  /* An import replaces the career outright, so it goes straight to disk
+     rather than waiting for the next autosave — a tab closed a second
+     later must not come back to the save it just replaced. Nothing is
+     credited for the trip: the career resumes where it left off. */
+  const importSave = (text) => {
+    const back = parseSave(text);
+    if (!back) {
+      /* disarmed again: a refused import should be re-read and
+         re-confirmed, not left one stray tap from loading */
+      setArmed(null);
+      setSettingsNote("That isn't a Mantle save. Paste the whole code, MANTLE1: and all.");
+      return false;
+    }
+    setS(back);
+    writeSave(back);
+    /* the imported bosses are not bosses you just beat: hand them to the
+       watcher first, or it announces somebody else's kill */
+    seenRef.current = back.bosses;
+    setAway(null); setRite(null); setArmed(null);
+    setSettings(false);
+    setSettingsNote("");
+    setTab("fight");
+    setNews("Save loaded. It picks up exactly where it left off — no offline time is credited for the trip.");
+    return true;
+  };
+
+  /* A do-over. The career goes back to the start and pays nothing for
+     it: what outlives a career normally — legacy, keepsakes, the record,
+     the day streak — outlives this too, and passing the cowl on stays
+     the only thing that earns legacy. */
+  const restart = () => {
+    setS((p) => ({
+      ...freshState(p.legacy),
+      allTimeFunding: p.allTimeFunding,
+      achieved: p.achieved,
+      traded: p.traded,
+      runs: p.runs || 0,
+      streak: p.streak,
+      keepsakes: p.keepsakes || {},
+      /* today's board comes with it: starting over is not a way to roll
+         a second slate and be paid twice for the same day */
+      contracts: p.contracts,
+      log: logged([], 0, "You start over. A do-over pays nothing — the legacy, the keepsakes, the record and the streak are what carry."),
+    }));
+    setAway(null); setNews(null); setRite(null); setArmed(null);
+    setSettings(false);
+    setTab("fight");
+  };
+
+  const clearLog = () => setS((p) => ({ ...p, log: [] }));
 
   /* ---- view helpers ---- */
   const priceIn = (key, which) => (item) => {
@@ -2049,6 +2269,8 @@ function useGame() {
     s, d, ready, tab: tabs.some(([id]) => id === tab) ? tab : "fight", setTab, branch, setBranch,
     mode, setMode, modes, todo, tabs, forecast, bossUp,
     away, setAway, news, setNews, armed, setArmed, rite, setRite, takeKeepsake, saveNote, tip, setTip, tipProps, hoverTip, TIP_W,
+    prefs, setPref, settings, openSettings, closeSettings, settingsNote, setSettingsNote,
+    exportSave, copySave, downloadSave, importSave, restart, clearLog, persist,
     resTip, levelTip, heroTip, fightTip, distTip, bossTip, abilityTip, abilitiesTip, gearTip, terrTip, powerTip,
     techTip, techEffect, queueTip, legacyTip, etaLabel, storageTip, crewTip, jobTip, marketTip, projectTip, achieveTip,
     boardTip, streakTip, stakeTip,
@@ -2151,6 +2373,9 @@ function HeroSelect({ g }) {
           </button>
         ))}
       </div>
+      <p className="n-select-foot">
+        <button className="n-ghost" onClick={g.openSettings}>Settings &amp; save data</button>
+      </p>
     </div>
   );
 }
@@ -2693,6 +2918,158 @@ function Rite({ g }) {
   );
 }
 
+/* Everything that isn't the city: the save itself, the two ways out of a
+   career, and the switches that belong on a person's own screen rather
+   than behind a tech. Reachable from the tab bar and from hero select,
+   because importing a save is the first thing somebody does on a new
+   browser, before there is a hero to import it into. */
+function Settings({ g }) {
+  const { s, prefs } = g;
+  const [code, setCode] = useState(() => g.exportSave());
+  const [box, setBox] = useState("");
+
+  /* the shown code and the one that leaves are always the same string */
+  const refresh = () => { const c = g.exportSave(); setCode(c); return c; };
+
+  /* The career keeps moving while the panel is open, so the code on
+     screen is kept current — except while it is selected, where
+     replacing it would yank the selection out from under a ctrl-C. */
+  useEffect(() => {
+    const id = setInterval(() => {
+      const el = typeof document !== "undefined" ? document.activeElement : null;
+      if (el && el.classList && el.classList.contains("n-code")) return;
+      setCode(g.exportSave());
+    }, 5000);
+    return () => clearInterval(id);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const readFile = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => setBox(String(reader.result || ""));
+    reader.onerror = () => g.setSettingsNote("That file wouldn't open.");
+    reader.readAsText(file);
+  };
+
+  const row = (key, label, blurb, options) => (
+    <div className="n-set-row" key={key}>
+      <span className="n-set-label">
+        {label}
+        <em className="n-set-blurb">{blurb}</em>
+      </span>
+      <span className="n-modes">
+        {options.map(([value, text]) => (
+          <button
+            key={String(value)}
+            className={"n-mode " + (prefs[key] === value ? "on" : "")}
+            aria-pressed={prefs[key] === value}
+            onClick={() => g.setPref(key, value)}
+          >
+            {text}
+          </button>
+        ))}
+      </span>
+    </div>
+  );
+
+  return (
+    <div className="n-set" role="dialog" aria-label="Settings">
+      <div className="n-set-box">
+        <div className="n-set-head">
+          <h2 className="n-rite-head">Settings</h2>
+          <button className="n-x" onClick={g.closeSettings}>Done</button>
+        </div>
+
+        <Section label="Comfort" sub="kept on this browser, not in the save" g={g} />
+        {row("numbers", "Numbers", "how the big ones read", [["short", "12.3M"], ["sci", "1.23e7"]])}
+        {row("autosave", "Autosave", "how often progress is written", AUTOSAVES.map((n) => [n, n + "s"]))}
+        {row("ticker", "Headline ticker", "the city's paper, under the tabs", [[true, "on"], [false, "off"]])}
+        {row("motion", "Animations", "bars, throbs and the flashpoint banner", [[true, "on"], [false, "off"]])}
+        {row("hotkeys", "Ability keys", "1–4 fire abilities in a fight", [[true, "on"], [false, "off"]])}
+        <div className="n-set-btns n-set-after-rows">
+          <button className="n-ghost" onClick={g.clearLog} disabled={!(s.log || []).length}>Clear the log</button>
+        </div>
+
+        <Section label="Your save" sub={g.saveNote || `written every ${prefs.autosave}s`} g={g} />
+        <p className="n-note">
+          The code below is the whole career. Keep it somewhere safe, or hand it to another browser and import it
+          there — a save carries everything, including the legacy and the record. It lands exactly where it left
+          off: no offline time is credited for the trip.
+        </p>
+        <textarea
+          className="n-code"
+          readOnly
+          rows={3}
+          value={code}
+          aria-label="Your save code"
+          onFocus={(e) => {
+            /* select the code someone is about to copy by hand, and make
+               sure it is the current one they are selecting */
+            const el = e.target;
+            refresh();
+            requestAnimationFrame(() => el.select());
+          }}
+        />
+        <div className="n-set-btns">
+          <button className="n-ghost" onClick={() => g.copySave(refresh())}>Copy the code</button>
+          <button className="n-ghost" onClick={() => g.downloadSave(refresh())}>Download it</button>
+          <button className="n-ghost" onClick={() => { refresh(); g.persist(); }}>Save now</button>
+        </div>
+
+        <textarea
+          className="n-code"
+          rows={3}
+          value={box}
+          placeholder="Paste a save code here"
+          aria-label="Paste a save code"
+          onChange={(e) => setBox(e.target.value)}
+        />
+        <div className="n-set-btns">
+          <label className="n-ghost n-file">
+            Load a file
+            <input
+              type="file"
+              accept=".txt,.json,text/plain,application/json"
+              onChange={(e) => { readFile(e.target.files && e.target.files[0]); e.target.value = ""; }}
+            />
+          </label>
+          <button
+            className={"n-ghost " + (g.armed === "import" ? "danger" : "")}
+            disabled={!box.trim()}
+            onClick={() => (g.armed === "import" ? g.importSave(box) : g.setArmed("import"))}
+          >
+            {g.armed === "import" ? "Confirm — replace this career" : "Import"}
+          </button>
+        </div>
+
+        <Section label="Starting over" sub="neither one can be taken back" g={g} />
+        <p className="n-note">
+          Starting the career over puts you back at hero select with nothing but what outlives a career anyway:
+          legacy, keepsakes, the record and the day streak. It pays no legacy and takes no keepsake — that is what
+          passing the cowl on is for, and it is always the better way out of a run you can afford to finish.
+          Erasing goes further and takes the save with it.
+        </p>
+        <div className="n-set-btns">
+          <button
+            className={"n-ghost " + (g.armed === "restart" ? "danger" : "")}
+            onClick={() => (g.armed === "restart" ? g.restart() : g.setArmed("restart"))}
+          >
+            {g.armed === "restart" ? "Confirm — start over" : "Start this career over"}
+          </button>
+          <button
+            className={"n-ghost " + (g.armed === "wipe" ? "danger" : "")}
+            onClick={() => (g.armed === "wipe" ? g.wipe() : g.setArmed("wipe"))}
+          >
+            {g.armed === "wipe" ? "Confirm — erase it all" : "Erase everything"}
+          </button>
+        </div>
+
+        {g.settingsNote && <p className="n-set-note">{g.settingsNote}</p>}
+      </div>
+    </div>
+  );
+}
+
 /* The city's paper of record: one running headline, set by whatever the
    game is actually doing. Pure flavour, and pure UI — nothing is saved. */
 function Ticker({ g }) {
@@ -2820,13 +3197,22 @@ export default function Mantle() {
   const g = useGame();
   const { s, d, tipProps } = g;
 
-  if (!g.ready) return (<div className="n"><style>{CSS}</style><p className="boot">Bringing the scanners up…</p></div>);
-  if (!s.hero) return (<div className="n"><style>{CSS}</style><HeroSelect g={g} /></div>);
+  /* animations off is a preference, not only a system setting */
+  const shell = "n" + (g.prefs.motion ? "" : " still");
+
+  if (!g.ready) return (<div className={shell}><style>{CSS}</style><p className="boot">Bringing the scanners up…</p></div>);
+  if (!s.hero) return (
+    <div className={shell}>
+      <style>{CSS}</style>
+      <HeroSelect g={g} />
+      {g.settings && <Settings g={g} />}
+    </div>
+  );
 
   const modeTag = g.mode === "max" ? "max" : g.mode > 1 ? "×" + g.mode : null;
 
   return (
-    <div className="n">
+    <div className={shell}>
       <style>{CSS}</style>
 
       <header className="n-top">
@@ -2850,9 +3236,10 @@ export default function Mantle() {
             )
           )}
         </nav>
+        <button className="n-gear" onClick={g.openSettings} aria-label="Settings" title="Settings">⚙</button>
       </header>
 
-      <Ticker g={g} />
+      {g.prefs.ticker && <Ticker g={g} />}
 
       <div className="n-body">
         <aside className="n-rail">
@@ -3072,12 +3459,7 @@ export default function Mantle() {
 
               <div className="n-foot">
                 <span>{g.saveNote}</span>
-                <button
-                  className={"n-ghost " + (g.armed === "wipe" ? "danger" : "")}
-                  onClick={() => (g.armed === "wipe" ? g.wipe() : g.setArmed("wipe"))}
-                >
-                  {g.armed === "wipe" ? "Confirm — erase it all" : "Erase save"}
-                </button>
+                <button className="n-ghost" onClick={g.openSettings}>Settings &amp; save data</button>
               </div>
             </>
           )}
@@ -3096,6 +3478,8 @@ export default function Mantle() {
       </button>
 
       {g.rite && s.estate && <Rite g={g} />}
+
+      {g.settings && <Settings g={g} />}
 
       {g.tip && (
         <div
@@ -3155,9 +3539,9 @@ const CSS = `
 .n-hero-perk { display: inline-block; margin-top: 7px; background: var(--yellow); border: 2px solid var(--ink); padding: 0 6px; font-size: 11px; font-weight: 700; }
 .n-hero-sig { display: block; margin-top: 6px; font-size: 11px; opacity: .75; }
 
-/* ---- top bar: five tabs, full width ---- */
-.n-top { flex-shrink: 0; background: var(--ink); }
-.n-tabs { display: flex; }
+/* ---- top bar: five tabs, full width, and the gear on the end ---- */
+.n-top { flex-shrink: 0; background: var(--ink); display: flex; align-items: stretch; }
+.n-tabs { display: flex; flex: 1; min-width: 0; }
 .n-tab {
   flex: 1; background: none; border: none; color: #9c968a; position: relative;
   font-family: var(--head); font-size: 15px; letter-spacing: .05em; text-transform: uppercase; padding: 6px 4px 5px;
@@ -3386,6 +3770,40 @@ const CSS = `
   padding: 2px 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .92;
 }
 
+/* ---- settings: the save, the do-over, and the switches ---- */
+.n-gear {
+  flex-shrink: 0; background: none; border: none; color: #9c968a;
+  font-size: 15px; line-height: 1; padding: 4px 11px 4px;
+}
+.n-gear:hover { color: var(--paper); }
+.n-set {
+  position: fixed; inset: 0; z-index: 55; display: flex; align-items: center; justify-content: center;
+  background: rgba(23,22,20,.55); padding: 16px;
+}
+.n-set-box {
+  background: var(--paper); border: 3px solid var(--ink); box-shadow: 6px 6px 0 var(--ink);
+  padding: 14px 16px 16px; max-width: 560px; width: 100%; max-height: 90vh; overflow-y: auto;
+}
+.n-set-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.n-set-head .n-rite-head { margin: 0; }
+.n-set-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--rule); }
+.n-set-label { font-size: 11.5px; font-weight: 700; flex: 1; min-width: 0; }
+.n-set-blurb { display: block; font-style: normal; font-size: 10px; font-weight: 400; opacity: .6; }
+.n-set-row .n-modes { flex-shrink: 0; }
+.n-set-after-rows { margin-top: 8px; }
+.n-code {
+  display: block; width: 100%; resize: vertical; margin: 0 0 6px; padding: 5px 7px;
+  font: inherit; font-size: 10.5px; line-height: 1.35; word-break: break-all;
+  background: #fff; color: var(--ink); border: 1.5px solid var(--ink);
+}
+.n-set-btns { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.n-set-btns .n-ghost:disabled { opacity: .4; cursor: not-allowed; }
+.n-file { position: relative; overflow: hidden; display: inline-block; }
+.n-file input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+.n-set-note { margin: 0; font-size: 11px; font-weight: 700; color: var(--red); }
+.n-select-foot { text-align: center; margin: 20px 0 0; }
+.n.still *, .n.still *::before, .n.still *::after { transition: none !important; animation: none !important; }
+
 /* ---- the rite: one keepsake from the estate ---- */
 .n-rite {
   position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
@@ -3463,6 +3881,8 @@ const CSS = `
   .n-abil { flex-basis: 45%; max-width: none; }
   .n-abils-info { display: none; }
   .n-badges { grid-template-columns: 1fr; }
+  .n-gear { padding: 4px 7px; }
+  .n-set-row { flex-wrap: wrap; }
   .n-cap { font-size: 8px; }
   .n-sec-s { display: none; }
   .n-queue-empty { display: none; }

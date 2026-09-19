@@ -1,7 +1,8 @@
 /* Drives the BUILT game in a real Chromium and checks what the engine
    tests can't: that the systems actually render and respond. Covers the
    flashpoint banner, patrol momentum, the bounty board and streak, a
-   stakeout round, the ticker, ownership marks, and the estate rite.
+   stakeout round, the ticker, ownership marks, the settings panel with
+   its import, export and do-over, and the estate rite.
      npm run test:ui
    The dependency is `playwright-core`, which drives a browser but ships
    none, so point CHROMIUM_PATH at a Chromium or Chrome binary if one
@@ -142,6 +143,74 @@ ok("the stakeout resolved to a cooldown", /next in/.test(await page.locator(".n-
 await page.getByRole("tab", { name: /Region/ }).click();
 await page.waitForTimeout(300);
 ok("a producer shows its next mark", /×2 at 25/.test(await page.locator(".n-item", { hasText: "ROOFTOP PERCH" }).innerText()));
+
+/* ---- settings: the switches, the code, the import, the do-over ---- */
+const page4 = await (await browser.newContext()).newPage();
+page4.on("pageerror", (e) => fail("settings page error: " + e.message));
+await page4.addInitScript((s) => localStorage.setItem("mantle:hero:v3", JSON.stringify(s)), { ...seeded, state: { ...seeded.state, flash: null } });
+await page4.goto(URL);
+await page4.waitForTimeout(1200);
+
+await page4.getByRole("button", { name: "Settings", exact: true }).click();
+await page4.waitForTimeout(200);
+ok("the gear opens settings", (await page4.locator(".n-set").count()) === 1);
+
+/* the export code is the career, tagged so it is obvious what it is */
+const shown = await page4.locator('textarea[aria-label="Your save code"]').inputValue();
+ok("a save code is offered", shown.startsWith("MANTLE1:") && shown.length > 40, shown.slice(0, 16));
+
+/* a switch takes effect at once and is still set after a reload */
+await page4.locator(".n-set-row", { hasText: "Headline ticker" }).getByRole("button", { name: "off" }).click();
+await page4.waitForTimeout(200);
+ok("the ticker switches off", (await page4.locator(".n-ticker").count()) === 0);
+await page4.locator(".n-set-row", { hasText: "Numbers" }).getByRole("button", { name: "1.23e7" }).click();
+await page4.waitForTimeout(200);
+ok("numbers switch to scientific", /e\d/.test(await page4.locator(".n-stat.tone-cyan .n-val").innerText()), await page4.locator(".n-stat.tone-cyan .n-val").innerText());
+await page4.reload();
+await page4.waitForTimeout(1200);
+ok("the switches survive a reload", (await page4.locator(".n-ticker").count()) === 0 && /e\d/.test(await page4.locator(".n-stat.tone-cyan .n-val").innerText()));
+
+/* importing a code replaces the career it is pasted into */
+const imported = "MANTLE1:" + Buffer.from(JSON.stringify({
+  at: Date.now(),
+  state: { ...seeded.state, hero: "nocturne", flash: null, own: { ...seeded.state.own, perch: 25 } },
+})).toString("base64");
+await page4.getByRole("button", { name: "Settings", exact: true }).click();
+await page4.waitForTimeout(200);
+await page4.locator('textarea[aria-label="Paste a save code"]').fill("not a save at all");
+await page4.getByRole("button", { name: "Import", exact: true }).click();
+await page4.getByRole("button", { name: /Confirm — replace/ }).click();
+await page4.waitForTimeout(200);
+ok("a code that isn't a save is refused", (await page4.locator(".n-set-note").count()) === 1 && (await page4.locator(".n-set").count()) === 1);
+await page4.locator('textarea[aria-label="Paste a save code"]').fill(imported);
+await page4.getByRole("button", { name: "Import", exact: true }).click();
+await page4.getByRole("button", { name: /Confirm — replace/ }).click();
+await page4.waitForTimeout(400);
+ok("importing closes the panel", (await page4.locator(".n-set").count()) === 0);
+/* the rail renders the hero's name uppercase, so match the text loosely */
+ok("the imported career is the one on screen", /nocturne/i.test(await page4.locator(".n-who .n-key").first().innerText()), await page4.locator(".n-who .n-key").first().innerText());
+const keptCode = await page4.evaluate(() => localStorage.getItem("mantle:hero:v3"));
+ok("an import is written to storage at once", /nocturne/.test(keptCode || ""));
+
+/* starting over is a do-over, not a prestige: back to hero select */
+await page4.getByRole("button", { name: "Settings", exact: true }).click();
+await page4.waitForTimeout(200);
+await page4.getByRole("button", { name: "Start this career over", exact: true }).click();
+await page4.getByRole("button", { name: /Confirm — start over/ }).click();
+await page4.waitForTimeout(400);
+ok("starting over lands at hero select", (await page4.locator(".n-hero").count()) === 4);
+
+/* hero select can reach it too, which is how a save gets into a browser
+   that has no career to open the tab bar with */
+await page4.getByRole("button", { name: /Settings & save data/ }).click();
+await page4.waitForTimeout(200);
+ok("hero select can reach settings too", (await page4.locator(".n-set").count()) === 1);
+await page4.locator(".n-set-row", { hasText: "Animations" }).getByRole("button", { name: "off" }).click();
+await page4.waitForTimeout(200);
+ok("animations switch off", (await page4.locator(".n.still").count()) === 1);
+await page4.keyboard.press("Escape");
+await page4.waitForTimeout(200);
+ok("escape closes settings", (await page4.locator(".n-set").count()) === 0);
 
 /* ---- the estate rite: confirm the pass, take a keepsake ---- */
 const rich = { at: Date.now(), state: { ...seeded.state, hero: "bastion", tech: { mantle: true }, careerFunding: 9e9, flash: null } };

@@ -188,5 +188,32 @@ ok("every achievement has a test", E.ACHIEVEMENTS.every((a) => typeof a.test ===
 const fresh = E.freshState();
 for (const a of E.ACHIEVEMENTS) { try { a.test(fresh, { level: 1 }); } catch (e) { fails++; console.log("FAIL achievement " + a.id + ": " + e.message); } }
 
+/* 17. the save codes players export, and the ones they paste back */
+let carried = { ...E.migrate(null), hero: "kilowatt", res: { leads: 12, salvage: 34, funding: 56, xp: 7 },
+  own: { ...E.freshState().own, perch: 9 }, totalXP: 4321, legacy: 3, keepsakes: { cowl: 2 },
+  log: [{ t: 5, text: "an em dash — and a ×, to prove the encoding holds" }] };
+const code = E.encodeSave(carried);
+ok("an exported code is tagged", code.startsWith("MANTLE1:"), code.slice(0, 12));
+const round = E.parseSave(code);
+ok("a code round-trips the career", !!round && round.hero === "kilowatt" && round.own.perch === 9 && round.totalXP === 4321);
+ok("a code round-trips what outlives it", !!round && round.legacy === 3 && round.keepsakes.cowl === 2);
+ok("a code round-trips non-ascii text", !!round && round.log[0].text === carried.log[0].text, JSON.stringify(round && round.log));
+ok("whitespace and a stray newline don't spoil a code", !!E.parseSave("  " + code.slice(0, 20) + "\n" + code.slice(20) + "  "));
+ok("the raw stored envelope imports too", E.parseSave(JSON.stringify({ at: Date.now(), state: carried })).hero === "kilowatt");
+ok("a bare state imports too", E.parseSave(JSON.stringify(carried)).hero === "kilowatt");
+for (const junk of ["", "   ", "hello", "{}", "[]", "null", "0", '{"at":1}', E.encodeSave(null).replace("MANTLE1:", "")])
+  ok("junk is refused, not loaded as a new career: " + JSON.stringify(junk).slice(0, 22), E.parseSave(junk) === null);
+const hurt = E.parseSave(E.encodeSave({ hero: "grayline", res: { leads: "lots", salvage: null, funding: NaN, xp: 3 }, own: { perch: "x" }, queue: "nope" }));
+ok("a damaged code imports as a game, not a crash", !!hurt && Number.isFinite(hurt.res.leads) && Number.isFinite(hurt.own.perch) && Array.isArray(hurt.queue));
+ok("a damaged code still derives", Number.isFinite(E.derive(hurt).global));
+
+/* 18. preferences: defaults hold, and nonsense never reaches the UI */
+const defs = E.cleanPrefs(null);
+ok("preferences fall back to the defaults", JSON.stringify(defs) === JSON.stringify(E.DEFAULT_PREFS), JSON.stringify(defs));
+ok("an unknown number style is refused", E.cleanPrefs({ numbers: "roman" }).numbers === "short");
+ok("a made-up autosave interval is refused", E.cleanPrefs({ autosave: 0 }).autosave === E.DEFAULT_PREFS.autosave);
+ok("a real autosave interval is kept", E.cleanPrefs({ autosave: 60 }).autosave === 60);
+ok("switches are on unless turned off", E.cleanPrefs({ ticker: "yes" }).ticker === true && E.cleanPrefs({ ticker: false }).ticker === false);
+
 console.log(fails ? `\n${fails} FAILED` : "\nall good");
 process.exit(fails ? 1 : 0);
