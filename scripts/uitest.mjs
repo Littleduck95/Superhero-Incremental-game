@@ -2,12 +2,16 @@
    tests can't: that the systems actually render and respond. Covers the
    flashpoint banner, patrol momentum, the bounty board and streak, a
    stakeout round, the ticker, ownership marks, and the estate rite.
-     npm run build && node scripts/uitest.mjs
-   Needs a Chromium binary: set CHROMIUM_PATH, or let Playwright find its
-   own. Starts its own `vite preview` on a spare port and stops it after.
+     npm run test:ui
+   The dependency is `playwright-core`, which drives a browser but ships
+   none, so point CHROMIUM_PATH at a Chromium or Chrome binary if one
+   isn't in the usual places. Starts its own `vite preview` on a spare
+   port and always stops it again, even when a check throws — a leaked
+   server would make every later run fail on the port.
    Exits non-zero on the first thing that is wrong. */
 import { chromium } from "playwright-core";
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,20 +23,69 @@ let fails = 0;
 const fail = (m) => { console.log("FAIL " + m); fails++; };
 const ok = (name, cond, extra = "") => (cond ? console.log("  ok  " + name) : fail(name + " " + extra));
 
-/* ---- serve dist/ ---- */
-const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { cwd: root, stdio: "ignore" });
+/* playwright-core brings no browser of its own: take CHROMIUM_PATH, then
+   the places a Chromium usually lands, and say so plainly if there is
+   none rather than failing inside launch(). */
+const findChromium = () => {
+  const named = process.env.CHROMIUM_PATH;
+  if (named) {
+    if (fs.existsSync(named)) return named;
+    throw new Error(`CHROMIUM_PATH is set to ${named}, which does not exist`);
+  }
+  const tries = [
+    "/opt/pw-browsers/chromium",
+    "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome",
+    "/snap/bin/chromium",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+  ];
+  const hit = tries.find((p) => fs.existsSync(p));
+  if (hit) return hit;
+  throw new Error("no Chromium found — set CHROMIUM_PATH to a Chrome or Chromium binary");
+};
+
+const answers = async () => {
+  try { return (await fetch(URL, { signal: AbortSignal.timeout(1500) })).ok; } catch { return false; }
+};
+
+/* Something already on the port would answer every request with whatever
+   it is serving — a stale build, silently passing. --strictPort stops the
+   new server binding but not the old one replying, so refuse up front. */
+if (await answers()) {
+  console.log(`FAIL something is already serving ${URL} — stop it first (a leaked preview server serves a stale build)`);
+  process.exit(1);
+}
+
+/* Serve dist/. Spawned in its own process group so the whole group can be
+   torn down: killing `npx` alone can leave the vite child holding the port. */
+const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], {
+  cwd: root, stdio: "ignore", detached: true,
+});
+const stopServer = () => {
+  try { process.kill(-server.pid, "SIGTERM"); } catch { /* already gone */ }
+  try { server.kill("SIGTERM"); } catch { /* already gone */ }
+};
+process.on("exit", stopServer);
+
 const up = async () => {
   for (let i = 0; i < 50; i++) {
-    try { const r = await fetch(URL); if (r.ok) return true; } catch { /* not yet */ }
+    if (await answers()) return true;
     await new Promise((r) => setTimeout(r, 200));
   }
   return false;
 };
-if (!(await up())) { console.log("FAIL preview server never came up — run `npm run build` first"); server.kill(); process.exit(1); }
+if (!(await up())) { console.log("FAIL preview server never came up — run `npm run build` first"); stopServer(); process.exit(1); }
 
-const browser = await chromium.launch(
-  process.env.CHROMIUM_PATH ? { executablePath: process.env.CHROMIUM_PATH } : {}
-);
+let browser;
+try {
+  browser = await chromium.launch({ executablePath: findChromium() });
+} catch (e) {
+  console.log("FAIL could not start a browser: " + e.message);
+  stopServer();
+  process.exit(1);
+}
+
+try {
 
 /* Seed a mid-game save: first boss down (opens the board), a live
    flashpoint, and a warm streak — before the app boots. */
@@ -105,6 +158,18 @@ await page3.locator(".n-item", { hasText: "TAP AGAIN TO CONFIRM" }).click();
 await page3.waitForTimeout(300);
 ok("the estate opens", (await page3.locator(".n-rite").count()) === 1);
 ok("three keepsakes are drawn", (await page3.locator(".n-rite .n-hero").count()) === 3);
+const drawn = (await page3.locator(".n-rite .n-hero-name").allInnerTexts()).join("|");
+
+/* backing out is free, but it is not a way to deal a fresh hand */
+await page3.getByRole("button", { name: /Not yet/ }).click();
+await page3.waitForTimeout(200);
+ok("backing out closes the estate", (await page3.locator(".n-rite").count()) === 0);
+await page3.locator(".n-item", { hasText: "PASS THE COWL ON" }).click();
+await page3.waitForTimeout(150);
+await page3.locator(".n-item", { hasText: "TAP AGAIN TO CONFIRM" }).click();
+await page3.waitForTimeout(300);
+ok("reopening deals the same three", (await page3.locator(".n-rite .n-hero-name").allInnerTexts()).join("|") === drawn, drawn);
+
 const kName = (await page3.locator(".n-rite .n-hero-name").first().innerText()).trim();
 await page3.locator(".n-rite .n-hero").first().click();
 await page3.waitForTimeout(500);
@@ -122,7 +187,12 @@ await page2.goto(URL);
 await page2.waitForTimeout(800);
 ok("fresh boot shows hero select", (await page2.locator(".n-hero").count()) === 4);
 
-await browser.close();
-server.kill();
+} catch (e) {
+  fail("threw: " + (e && e.message ? e.message : e));
+} finally {
+  try { await browser.close(); } catch { /* already down */ }
+  stopServer();
+}
+
 console.log(fails ? `\n${fails} FAILED` : "\nui all good");
 process.exit(fails ? 1 : 0);

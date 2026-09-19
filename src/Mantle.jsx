@@ -470,6 +470,7 @@ const freshState = (legacy = 0) => ({
   stakeArm: false,        /* a stakeout is underway; one resolve per start */
   contracts: null,        /* the board; rolled by the wall clock, not game time */
   keepsakes: {},          /* taken at each passing of the cowl; outlives it */
+  estate: null,           /* the three drawn for this passing, once drawn */
   log: [],
   time: 0,
   totalXP: 0,
@@ -530,6 +531,12 @@ function migrate(saved) {
   for (const gi of GEAR) back.gear[gi.id] = num(back.gear[gi.id]);
   for (const k in back.ranks) back.ranks[k] = num(back.ranks[k]);
   for (const k in back.cleared) back.cleared[k] = num(back.cleared[k]);
+  /* keepsake counts multiply combat and income, so a junk or negative
+     one would poison every stat rather than merely miscount */
+  for (const k in back.keepsakes) back.keepsakes[k] = Math.max(0, Math.floor(num(back.keepsakes[k])));
+  back.estate = back.estate && Array.isArray(back.estate.picks)
+    ? { picks: back.estate.picks.filter((id) => KEEPSAKES.some((k) => k.id === id)) }
+    : null;
   for (const m of MARKET) back.market[m.id] = num(back.market[m.id], 1);
   for (const k of ["time", "totalXP", "legacy", "careerFunding", "allTimeFunding", "traded", "patrols", "stakeoutAt", "runs"])
     back[k] = num(back[k]);
@@ -1927,18 +1934,26 @@ function useGame() {
 
   /* Passing the cowl is a rite in two steps: confirm, then take one
      keepsake from the old career's estate. Nothing resets until the
-     choice lands, so backing out (or a refresh) costs nothing. */
+     choice lands, so backing out (or a refresh) costs nothing — but the
+     three drawn are saved with the career, so closing the rite is not a
+     way to re-roll the draw until the wanted one turns up. */
   const handOver = () => {
-    const picks = [];
-    const bag = [...KEEPSAKES];
-    while (picks.length < 3 && bag.length) picks.push(bag.splice(Math.floor(Math.random() * bag.length), 1)[0].id);
-    setRite({ gain: legacyFor(live.current.careerFunding), picks });
+    setS((p) => {
+      if (p.estate && Array.isArray(p.estate.picks) && p.estate.picks.length) return p;
+      const picks = [];
+      const bag = [...KEEPSAKES];
+      while (picks.length < 3 && bag.length) picks.push(bag.splice(Math.floor(Math.random() * bag.length), 1)[0].id);
+      return { ...p, estate: { picks } };
+    });
+    setRite(true);
     setArmed(null);
   };
 
   const takeKeepsake = (id) => {
     if (!KEEPSAKES.some((k) => k.id === id)) return;
     setS((p) => {
+      /* only ever one of the three actually drawn */
+      if (!p.estate || !p.estate.picks.includes(id)) return p;
       const gain = legacyFor(p.careerFunding);
       return {
         ...freshState(p.legacy + gain),
@@ -2649,16 +2664,18 @@ function Bounties({ g }) {
 /* The estate: passing the cowl on, the successor takes one thing. The
    career only resets once something is taken, so backing out is free. */
 function Rite({ g }) {
-  const { rite, s } = g;
+  const { s } = g;
+  const picks = s.estate && Array.isArray(s.estate.picks) ? s.estate.picks : [];
   return (
     <div className="n-rite" role="dialog" aria-label="The estate of the old cowl">
       <div className="n-rite-box">
         <h2 className="n-rite-head">The estate of the old cowl</h2>
         <p className="n-rite-sub">
-          +{rite.gain} legacy comes with the name. Take one thing from the estate — the rest goes to the city, along with everything else.
+          +{g.pendingLegacy} legacy comes with the name. Take one thing from the estate — the rest goes to the city, along with everything else.
+          The three are drawn once: closing this doesn't deal you another hand.
         </p>
         <div className="n-heroes">
-          {rite.picks.map((id) => {
+          {picks.map((id) => {
             const k = KEEPSAKES.find((x) => x.id === id);
             const owned = (s.keepsakes || {})[id] || 0;
             return (
@@ -3078,7 +3095,7 @@ export default function Mantle() {
         )}
       </button>
 
-      {g.rite && <Rite g={g} />}
+      {g.rite && s.estate && <Rite g={g} />}
 
       {g.tip && (
         <div

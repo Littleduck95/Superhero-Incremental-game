@@ -173,6 +173,12 @@ const kitted = E.derive({ ...ms, own: { ...ms.own, perch: 10 }, keepsakes: { bag
 ok("keepsakes raise power and resolve", Math.abs(kitted.power / bare.power - 1.2) < 1e-9 && Math.abs(kitted.resolve / bare.resolve - 1.25) < 1e-9);
 ok("keepsakes stack per copy", Math.abs(kitted.gross.leads / bare.gross.leads - 1.4) < 1e-9, `${kitted.gross.leads / bare.gross.leads}`);
 ok("every keepsake id is distinct", new Set(E.KEEPSAKES.map((k) => k.id)).size === E.KEEPSAKES.length);
+const junkKeep = E.migrate({ hero: "grayline", keepsakes: { bag: "x", clock: -30, cowl: 2.7, nonesuch: 5 }, estate: { picks: ["bag", "made-up"] } });
+ok("junk keepsake counts are scrubbed", junkKeep.keepsakes.bag === 0 && junkKeep.keepsakes.clock === 0 && junkKeep.keepsakes.cowl === 2);
+const dk = E.derive(junkKeep);
+ok("a junk estate can't poison the stats", Number.isFinite(dk.power) && Number.isFinite(dk.resolve) && Number.isFinite(dk.cdMult) && dk.cdMult > 0);
+ok("an unknown keepsake is ignored", Number.isFinite(dk.kpCount) && dk.kpCount === 2, "count " + dk.kpCount);
+ok("a drawn estate keeps only real ids", junkKeep.estate.picks.join() === "bag", junkKeep.estate.picks.join());
 
 /* 16. every tech, job and project id is sane and reachable */
 const ids = new Set();
