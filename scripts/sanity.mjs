@@ -157,7 +157,24 @@ ok("garbage crew is countable", Number.isFinite(junk.crew.n) && Number.isFinite(
 const junkStep = E.step(junk, 60, { quiet: true });
 ok("a scrubbed save steps cleanly", Number.isFinite(junkStep.res.funding) && Number.isFinite(junkStep.totalXP));
 
-/* 14. every tech, job and project id is sane and reachable */
+/* 14. ownership marks double producers, and only producers */
+let ms = { ...E.migrate(null), hero: "grayline" };
+const at24 = E.derive({ ...ms, own: { ...ms.own, perch: 24 } }).gross.leads / 24;
+const at25 = E.derive({ ...ms, own: { ...ms.own, perch: 25 } }).gross.leads / 25;
+ok("the 25th perch doubles the lot", Math.abs(at25 / at24 - 2) < 1e-9, `${at24} -> ${at25}`);
+ok("marks count correctly", E.msCrossed(24) === 0 && E.msCrossed(25) === 1 && E.msCrossed(400) === 6 && E.msCrossed(500) === 7);
+ok("the next mark is always ahead", E.msNext(0) === 25 && E.msNext(25) === 50 && E.msNext(400) === 500 && E.msNext(650) === 700);
+const capsAt = (n) => E.derive({ ...ms, own: { ...ms.own, lockup: n } }).caps.funding;
+ok("lockups take no marks", Math.abs((capsAt(25) - capsAt(24)) - (capsAt(24) - capsAt(23))) < 2, "storage steps stay even");
+
+/* 15. keepsakes apply, stack, and survive the numbers */
+const bare = E.derive({ ...ms, own: { ...ms.own, perch: 10 } });
+const kitted = E.derive({ ...ms, own: { ...ms.own, perch: 10 }, keepsakes: { bag: 1, cowl: 1, frequencies: 2 } });
+ok("keepsakes raise power and resolve", Math.abs(kitted.power / bare.power - 1.2) < 1e-9 && Math.abs(kitted.resolve / bare.resolve - 1.25) < 1e-9);
+ok("keepsakes stack per copy", Math.abs(kitted.gross.leads / bare.gross.leads - 1.4) < 1e-9, `${kitted.gross.leads / bare.gross.leads}`);
+ok("every keepsake id is distinct", new Set(E.KEEPSAKES.map((k) => k.id)).size === E.KEEPSAKES.length);
+
+/* 16. every tech, job and project id is sane and reachable */
 const ids = new Set();
 for (const t of E.TECH) { ok("tech id unique: " + t.id, !ids.has(t.id)); ids.add(t.id); }
 for (const t of E.TECH) for (const r of t.req) ok(`${t.id} requires a real node`, ids.has(r), r);

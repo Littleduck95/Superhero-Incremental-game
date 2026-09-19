@@ -19,6 +19,10 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
  *    POWERS   ranks bought with XP, multiplying region and combat
  *    WORKS    city projects paid for in slices, stacking forever
  *    RECORD   achievements, kept when the cowl changes hands
+ *    MARKS    ownership milestones: every mark a producing building
+ *             crosses (25, 50, 100...) doubles what it makes
+ *    ESTATE   passing the cowl on, the successor takes one keepsake of
+ *             three drawn - permanent, stacking, a build decision
  *    BOUNTIES three contracts a day off the board, scaled to your
  *             numbers when they roll. Filling any one keeps the day
  *             streak alive; the streak and the stakeout minigame are
@@ -198,6 +202,20 @@ const ACHIEVEMENTS = [
   { id: "branch", name: "Specialist", blurb: "Finish a whole branch of the tree.", test: (s) => BRANCHES.some((b) => TECH.every((t) => t.branch !== b.id || s.tech[t.id])) },
   { id: "legacy1", name: "Succession", blurb: "Pass the cowl on once.", test: (s) => s.runs >= 1 },
   { id: "legacy5", name: "The Mantle", blurb: "Pass the cowl on five times.", test: (s) => s.runs >= 5 },
+];
+
+/* Keepsakes: passing the cowl on, the successor takes one thing from
+   the old career's estate — drawn three at a time, chosen once, kept
+   forever, and stacking if taken again. Resets that all feel the same
+   stop being worth doing; this makes each one a build decision too. */
+const KEEPSAKES = [
+  { id: "cowl", name: "The First Cowl", gain: { resolve: 0.25 }, blurb: "Torn, restitched, and heavier than it looks. +25% resolve." },
+  { id: "bag", name: "The Heavy Bag", gain: { power: 0.2 }, blurb: "Sand still leaks from the seam you split. +20% power." },
+  { id: "frequencies", name: "The Old Frequencies", gain: { leads: 0.2 }, blurb: "A channel the new scanners never carried. +20% leads." },
+  { id: "ledger", name: "The Ledger of Names", gain: { funding: 0.15 }, blurb: "Everyone who ever owed the cowl a favour. +15% funding." },
+  { id: "keyring", name: "The Spare Keys", gain: { crew: 0.1 }, blurb: "Every door the old crew ever copied. Crew work 10% harder." },
+  { id: "casefiles", name: "The Case Files", gain: { xp: 0.1 }, blurb: "Every mistake, annotated in the margin. +10% XP a kill." },
+  { id: "clock", name: "The Precinct Clock", gain: { cd: 0.05 }, blurb: "It runs four minutes fast, and so do you. Abilities recharge 5% faster." },
 ];
 
 /* Live-play flavour: small windfalls and the odd hot streak. Deliberately
@@ -382,6 +400,9 @@ const TUNE = {
   marketRecover: 0.006,   /* share of the gap back to par, a second */
   marketFloor: 0.25,
   overflowRate: 0.5,      /* Fence Network sells overflow at half price */
+  milestones: [25, 50, 100, 200, 300, 400], /* ownership marks that double a producer... */
+  milestoneEvery: 100,    /* ...and every this-many beyond the last */
+  milestoneMult: 2,
   eventEvery: 420,        /* mean seconds between live events */
   flashEvery: 300,        /* mean seconds between flashpoints */
   flashWindow: 20,        /* seconds to respond before it's gone */
@@ -448,6 +469,7 @@ const freshState = (legacy = 0) => ({
   stakeoutAt: 0,
   stakeArm: false,        /* a stakeout is underway; one resolve per start */
   contracts: null,        /* the board; rolled by the wall clock, not game time */
+  keepsakes: {},          /* taken at each passing of the cowl; outlives it */
   log: [],
   time: 0,
   totalXP: 0,
@@ -500,7 +522,7 @@ function migrate(saved) {
      NaN factory. The loader parks a save that still won't load under a
      rescue key rather than letting the autosave pave over it. */
   const num = (v, d0 = 0) => (Number.isFinite(v) ? v : d0);
-  for (const k of ["ranks", "tech", "cleared", "bosses", "projects", "autosell", "achieved"])
+  for (const k of ["ranks", "tech", "cleared", "bosses", "projects", "autosell", "achieved", "keepsakes"])
     if (!back[k] || typeof back[k] !== "object" || Array.isArray(back[k])) back[k] = {};
   if (!Array.isArray(back.queue)) back.queue = [];
   for (const k of RES_IDS) back.res[k] = num(back.res[k]);
@@ -527,6 +549,22 @@ const bossReady = (s, dist) => !s.bosses[dist.id] && (s.cleared[dist.id] || 0) >
 
 const jobById = (id) => JOBS.find((j) => j.id === id);
 const projectById = (id) => PROJECTS.find((p) => p.id === id);
+
+/* Ownership milestones: every mark a producing building crosses doubles
+   what it makes — near goals with a burst of progress at each one, and
+   a reason the 25th perch is worth more than the 24th. */
+function msCrossed(n) {
+  let c = 0;
+  for (const m of TUNE.milestones) if (n >= m) c++;
+  const last = TUNE.milestones[TUNE.milestones.length - 1];
+  if (n >= last + TUNE.milestoneEvery) c += Math.floor((n - last) / TUNE.milestoneEvery);
+  return c;
+}
+function msNext(n) {
+  for (const m of TUNE.milestones) if (n < m) return m;
+  const last = TUNE.milestones[TUNE.milestones.length - 1];
+  return last + (Math.floor((n - last) / TUNE.milestoneEvery) + 1) * TUNE.milestoneEvery;
+}
 
 /* Crew assignments are clamped on read, so a safehouse lost to a reset or
    a hand who walked can never leave more people working than exist. */
@@ -573,6 +611,22 @@ function derive(s, opts = {}) {
     }
     if (t.cut) for (const k in t.cut) cut[k] *= t.cut[k];
   }
+  /* ownership milestones only touch producers: storage, beds and the
+     fight buildings keep their own math */
+  for (const t of TERRITORY)
+    if (t.makes && t.rate) bMult[t.id] *= Math.pow(TUNE.milestoneMult, msCrossed(s.own[t.id] || 0));
+
+  /* keepsakes: taken at each passing of the cowl, kept forever */
+  const kp = { resolve: 0, power: 0, leads: 0, funding: 0, xp: 0, crew: 0, cd: 0 };
+  let kpCount = 0;
+  for (const k of KEEPSAKES) {
+    const n = (s.keepsakes || {})[k.id] || 0;
+    if (!n) continue;
+    kpCount += n;
+    for (const g in k.gain) kp[g] += k.gain[g] * n;
+  }
+  mult.leads *= 1 + kp.leads;
+  mult.funding *= 1 + kp.funding;
 
   const level = levelOf(s.totalXP);
   const held = DISTRICTS.filter((x) => s.bosses[x.id]).length;
@@ -615,7 +669,7 @@ function derive(s, opts = {}) {
   /* ---- crew: beds decide how many, jobs decide what they are worth ---- */
   const split = crewSplit(s);
   const beds = Math.floor((TUNE.bedsBase + TUNE.bedsPer * (s.own.safehouse || 0)) * (tech.recruit ? 1.5 : 1));
-  const crewMult = tech.command ? 1.5 : 1;
+  const crewMult = (tech.command ? 1.5 : 1) * (1 + kp.crew);
   const crewMakes = { leads: 0, salvage: 0, funding: 0 };
   let crewCombat = 0, crewXP = 0;
   for (const j of JOBS) {
@@ -670,12 +724,12 @@ function derive(s, opts = {}) {
     (tech.cascade ? 1 + 0.005 * totalRanks : 1) *
     (tech.stims ? 1.5 : 1) *
     (tech.overclock ? 2 : 1);
-  const power = (1 + addPower) * mult.power * fightMult * (1 + proj.power);
-  const resolve = (TUNE.baseResolve + addResolve) * mult.resolve * (mods.resolve || 1) * fightMult * (1 + proj.resolve);
-  const xpMult = (1 + xpBonus) * mult.xp * (1 + proj.xp + crewXP);
+  const power = (1 + addPower) * mult.power * fightMult * (1 + proj.power) * (1 + kp.power);
+  const resolve = (TUNE.baseResolve + addResolve) * mult.resolve * (mods.resolve || 1) * fightMult * (1 + proj.resolve) * (1 + kp.resolve);
+  const xpMult = (1 + xpBonus) * mult.xp * (1 + proj.xp + crewXP + kp.xp);
 
   /* abilities: the tree opens them, the two buildings and Tempo shape them */
-  const cdMult = projCd * (tech.tempo ? 0.75 : 1) / (1 + TUNE.safehouseEach * (s.own.safehouse || 0));
+  const cdMult = projCd * (tech.tempo ? 0.75 : 1) * (1 - Math.min(0.5, kp.cd)) / (1 + TUNE.safehouseEach * (s.own.safehouse || 0));
   const abilMult = 1 + TUNE.gymEach * (s.own.gym || 0);
   const abilities = ABILITIES.filter((a) => tech[a.tech]).map((a) => {
     const cd = a.cd * cdMult;
@@ -713,7 +767,7 @@ function derive(s, opts = {}) {
 
   return {
     hero, powers, mult, bMult, cut, level, levelMult, global, gross, totalRanks, towerEach, held,
-    caps, capMult, price, proj, projCd, projDone, badges, badgeMult, boon, streakDays, streakMult,
+    caps, capMult, price, proj, projCd, projDone, badges, badgeMult, boon, streakDays, streakMult, kp, kpCount,
     crew: split, beds, crewMult, crewMakes, crewCombat, crewXP, upkeep,
     patrol, power, resolve, xpMult, fightMult, dist, ttk, ttkEff, damageTaken, winnable, xpRate,
     abilities, auto, cdMult, abilMult, sustain,
@@ -1280,11 +1334,11 @@ const toneOf = (id) => RESOURCES.find((r) => r.id === id)?.tone ?? "plain";
 /* Exposed for the balance script in scripts/. Not used by the UI. */
 export const engine = {
   RESOURCES, HEROES, POWERS, DISTRICTS, ABILITIES, GEAR, TERRITORY, TECH, TUNE,
-  JOBS, PROJECTS, MARKET, ACHIEVEMENTS, FLASHPOINTS, CONTRACTS, METRICS,
+  JOBS, PROJECTS, MARKET, ACHIEVEMENTS, FLASHPOINTS, CONTRACTS, METRICS, KEEPSAKES,
   freshState, migrate, derive, step, costOf, powerCost, canPay, maxAffordable,
   unlocked, bossReady, forecastBoss, startBoss, bestDistrict, levelOf,
   crewSplit, projectCost, projectMax, projectAt, marketDip,
-  rollContracts, contractTick, settleBoard, windfall, mergeBoon, catchUp,
+  rollContracts, contractTick, settleBoard, windfall, mergeBoon, catchUp, msCrossed, msNext,
 };
 
 /* ============================ THE HOOK ============================ */
@@ -1298,6 +1352,7 @@ function useGame() {
   const [away, setAway] = useState(null);
   const [news, setNews] = useState(null);
   const [armed, setArmed] = useState(null);
+  const [rite, setRite] = useState(null); /* the keepsake choice mid-prestige */
   const [saveNote, setSaveNote] = useState("");
   const [tip, setTip] = useState(null);
 
@@ -1560,7 +1615,9 @@ function useGame() {
     if (t.id === "gym") return `${t.blurb} Each one adds ${pct(TUNE.gymEach)} to what every ability does: Haymaker damage, Second Wind healing, and how long Brace and Surge last. ${own} of them have abilities at ${x(d.abilMult)}.`;
     if (!t.makes) return `${t.blurb} You hold ${own}.`;
     const each = t.rate * d.bMult[t.id] * d.mult[t.makes] * ((d.hero?.mods || {})[t.makes] || 1) * d.global;
-    return `${t.blurb} You hold ${own}, at ${rate(each * own)} ${nameOf(t.makes).toLowerCase()} a second. Tech has these at ${x(d.bMult[t.id])} and your powers at ${x(d.mult[t.makes])}. Each costs ${pct(t.growth - 1)} more than the last.`;
+    const marks = msCrossed(own);
+    return `${t.blurb} You hold ${own}, at ${rate(each * own)} ${nameOf(t.makes).toLowerCase()} a second. Tech and ${marks} ownership mark${marks === 1 ? "" : "s"} have these at ${x(d.bMult[t.id])} and your powers at ${x(d.mult[t.makes])}. ` +
+      `Every mark — ${TUNE.milestones.join(", ")}, then every ${TUNE.milestoneEvery} — doubles what they make; the next is at ${amt(msNext(own))}. Each costs ${pct(t.growth - 1)} more than the last.`;
   };
 
   const powerTip = (p) => {
@@ -1868,24 +1925,39 @@ function useGame() {
       return { ...p, res, tech: { ...p.tech, [t.id]: true } };
     });
 
+  /* Passing the cowl is a rite in two steps: confirm, then take one
+     keepsake from the old career's estate. Nothing resets until the
+     choice lands, so backing out (or a refresh) costs nothing. */
   const handOver = () => {
-    const gain = legacyFor(s.careerFunding);
-    setS((p) => ({
-      ...freshState(p.legacy + gain),
-      allTimeFunding: p.allTimeFunding,
-      achieved: p.achieved,
-      traded: p.traded,
-      runs: (p.runs || 0) + 1,
-      streak: p.streak,
-      /* keep today's filled bounties so the board can't roll a second,
-         double-paying slate on the same day; a board with nothing filled
-         has paid nothing, so the new career gets a fresh one */
-      contracts: p.contracts && Array.isArray(p.contracts.list) && p.contracts.list.some((c) => c.done)
-        ? { day: p.contracts.day, list: p.contracts.list.filter((c) => c.done) }
-        : null,
-      log: logged(p.log, 0, `The cowl changes hands. +${gain} legacy carried into the next one.`),
-    }));
+    const picks = [];
+    const bag = [...KEEPSAKES];
+    while (picks.length < 3 && bag.length) picks.push(bag.splice(Math.floor(Math.random() * bag.length), 1)[0].id);
+    setRite({ gain: legacyFor(live.current.careerFunding), picks });
     setArmed(null);
+  };
+
+  const takeKeepsake = (id) => {
+    if (!KEEPSAKES.some((k) => k.id === id)) return;
+    setS((p) => {
+      const gain = legacyFor(p.careerFunding);
+      return {
+        ...freshState(p.legacy + gain),
+        allTimeFunding: p.allTimeFunding,
+        achieved: p.achieved,
+        traded: p.traded,
+        runs: (p.runs || 0) + 1,
+        streak: p.streak,
+        keepsakes: { ...p.keepsakes, [id]: ((p.keepsakes || {})[id] || 0) + 1 },
+        /* keep today's filled bounties so the board can't roll a second,
+           double-paying slate on the same day; a board with nothing filled
+           has paid nothing, so the new career gets a fresh one */
+        contracts: p.contracts && Array.isArray(p.contracts.list) && p.contracts.list.some((c) => c.done)
+          ? { day: p.contracts.day, list: p.contracts.list.filter((c) => c.done) }
+          : null,
+        log: logged(p.log, 0, `The cowl changes hands. +${gain} legacy, and ${KEEPSAKES.find((k) => k.id === id).name} comes with it.`),
+      };
+    });
+    setRite(null);
     setTab("fight");
   };
 
@@ -1914,7 +1986,7 @@ function useGame() {
     : t.id === "safehouse" ? `recharge ${x(1 / (1 + TUNE.safehouseEach * (s.own.safehouse || 0)))} · −${pct(TUNE.safehouseEach)} each`
     : t.id === "gym" ? `abilities ${x(d.abilMult)} · +${pct(TUNE.gymEach)} each`
     : !t.makes ? "held"
-    : `${rate(t.rate * d.bMult[t.id] * d.mult[t.makes] * ((d.hero?.mods || {})[t.makes] || 1) * d.global)} ${nameOf(t.makes).toLowerCase()}/s each`;
+    : `${rate(t.rate * d.bMult[t.id] * d.mult[t.makes] * ((d.hero?.mods || {})[t.makes] || 1) * d.global)} ${nameOf(t.makes).toLowerCase()}/s each · ×${TUNE.milestoneMult} at ${amt(msNext(s.own[t.id] || 0))}`;
 
   const gearLine = (gi) =>
     gi.stat === "power" ? `+${rate(gi.per * d.mult.power * d.fightMult)} power each`
@@ -1961,7 +2033,7 @@ function useGame() {
   return {
     s, d, ready, tab: tabs.some(([id]) => id === tab) ? tab : "fight", setTab, branch, setBranch,
     mode, setMode, modes, todo, tabs, forecast, bossUp,
-    away, setAway, news, setNews, armed, setArmed, saveNote, tip, setTip, tipProps, hoverTip, TIP_W,
+    away, setAway, news, setNews, armed, setArmed, rite, setRite, takeKeepsake, saveNote, tip, setTip, tipProps, hoverTip, TIP_W,
     resTip, levelTip, heroTip, fightTip, distTip, bossTip, abilityTip, abilitiesTip, gearTip, terrTip, powerTip,
     techTip, techEffect, queueTip, legacyTip, etaLabel, storageTip, crewTip, jobTip, marketTip, projectTip, achieveTip,
     boardTip, streakTip, stakeTip,
@@ -2574,6 +2646,64 @@ function Bounties({ g }) {
   );
 }
 
+/* The estate: passing the cowl on, the successor takes one thing. The
+   career only resets once something is taken, so backing out is free. */
+function Rite({ g }) {
+  const { rite, s } = g;
+  return (
+    <div className="n-rite" role="dialog" aria-label="The estate of the old cowl">
+      <div className="n-rite-box">
+        <h2 className="n-rite-head">The estate of the old cowl</h2>
+        <p className="n-rite-sub">
+          +{rite.gain} legacy comes with the name. Take one thing from the estate — the rest goes to the city, along with everything else.
+        </p>
+        <div className="n-heroes">
+          {rite.picks.map((id) => {
+            const k = KEEPSAKES.find((x) => x.id === id);
+            const owned = (s.keepsakes || {})[id] || 0;
+            return (
+              <button key={id} className="n-hero" onClick={() => g.takeKeepsake(id)}>
+                <span className="n-hero-name">{k.name}</span>
+                <span className="n-hero-epithet">{k.blurb}</span>
+                {owned > 0 && <span className="n-hero-perk">held ×{owned} — takes another, and they stack</span>}
+              </button>
+            );
+          })}
+        </div>
+        <button className="n-ghost n-rite-stay" onClick={() => g.setRite(null)}>Not yet — keep this career</button>
+      </div>
+    </div>
+  );
+}
+
+/* The city's paper of record: one running headline, set by whatever the
+   game is actually doing. Pure flavour, and pure UI — nothing is saved. */
+function Ticker({ g }) {
+  const { s, d } = g;
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setN((v) => v + 1), 12000);
+    return () => clearInterval(id);
+  }, []);
+  const pool = [];
+  if (g.bossUp) pool.push(`${d.dist.boss.name} SEEN IN DAYLIGHT — ${d.dist.name} HOLDS ITS BREATH`);
+  if (d.full.length) pool.push(`LOCKUPS FULL: ${d.full.map(nameOf).join(", ").toUpperCase()} GOING BEGGING, SAYS FENCE`);
+  if (d.crew.idle > 0) pool.push(`${d.crew.idle} HAND${d.crew.idle === 1 ? "" : "S"} IDLE AT THE SAFEHOUSE, PAYROLL UNMOVED`);
+  if (d.boon) pool.push("EVERY SCANNER IN TOWN TALKING AT ONCE");
+  if ((s.streak || {}).days > 1) pool.push(`DAY ${s.streak.days}: THE COWL KEEPS ITS APPOINTMENTS`);
+  if (s.flash) pool.push("SOMETHING IS HAPPENING RIGHT NOW — DETAILS AS THEY COME");
+  if (!d.winnable) pool.push(`${d.dist.name.toUpperCase()} TOO HOT, WITNESSES SAY`);
+  pool.push(
+    `CRIME DOWN IN ${d.held} DISTRICT${d.held === 1 ? "" : "S"}, SKEPTICS UP EVERYWHERE`,
+    "WHO PAYS FOR THE PERCHES? AN INVESTIGATION",
+    "COUNCIL DENIES EVERYTHING, INCLUDING THIS HEADLINE",
+    `LEVEL ${d.level} VIGILANTE 'JUST GETTING STARTED', SOURCES CLAIM`,
+    "SCRAP PRICES STEADY; FENCE DECLINES COMMENT, TWICE",
+    "MASKED FIGURE PAYS FOR DAMAGES, BAFFLING ALL",
+  );
+  return <div className="n-ticker" aria-hidden="true">✦ {pool[n % pool.length]}</div>;
+}
+
 /* A rolling record of everything the city did while you were looking elsewhere. */
 function Log({ g }) {
   const [open, setOpen] = useState(false);
@@ -2704,6 +2834,8 @@ export default function Mantle() {
           )}
         </nav>
       </header>
+
+      <Ticker g={g} />
 
       <div className="n-body">
         <aside className="n-rail">
@@ -2849,7 +2981,8 @@ export default function Mantle() {
             <>
               <p className="n-note">
                 The cowl outlives whoever is under it. Pass it on and the region, the gear, the
-                powers, the bosses and the whole tree go. You pick a new hero, and they start ahead of where you did.
+                powers, the bosses and the whole tree go. You pick a new hero, they start ahead of
+                where you did, and they take one keepsake from the old career's estate.
               </p>
               <Slab
                 flat
@@ -2866,12 +2999,45 @@ export default function Mantle() {
                 <Slab
                   label={g.armed === "hand" ? "Tap again to confirm" : "Pass the cowl on"}
                   count={0}
-                  sub={g.pendingLegacy > 0 ? `Worth +${g.pendingLegacy} legacy. Everything else resets.` : "Bring in more funding first."}
+                  sub={g.pendingLegacy > 0 ? `Worth +${g.pendingLegacy} legacy and one keepsake from the estate. Everything else resets.` : "Bring in more funding first."}
                   res={s.res}
                   ok={g.pendingLegacy > 0}
                   onBuy={() => (g.armed === "hand" ? g.handOver() : g.setArmed("hand"))}
                 />
               )}
+
+              {d.kpCount > 0 && (
+                <>
+                  <Section label="Keepsakes" sub={`${d.kpCount} taken from ${s.runs} career${s.runs === 1 ? "" : "s"} · kept forever`} g={g} />
+                  <div className="n-badges">
+                    {KEEPSAKES.filter((k) => (s.keepsakes || {})[k.id]).map((k) => (
+                      <span key={k.id} className="n-badge-card got">
+                        <b>{k.name}{s.keepsakes[k.id] > 1 ? ` ×${s.keepsakes[k.id]}` : ""}</b>
+                        {k.blurb}
+                      </span>
+                    ))}
+                  </div>
+                </>
+              )}
+
+              <Section label="The Career" sub="what the record shows" g={g} />
+              <div className="n-career">
+                {[
+                  ["Under the cowl", duration(s.time)],
+                  ["Fights won", amt(METRICS.kills(s))],
+                  ["Patrols walked", amt(s.patrols || 0)],
+                  ["Districts held", String(d.held)],
+                  ["Moved on the market", amt(s.traded)],
+                  ["Funding, all careers", amt(s.allTimeFunding)],
+                  ["Careers", String(s.runs || 0)],
+                ].map(([k, v]) => (
+                  <span className="n-career-card" key={k}>
+                    <span className="n-career-k">{k}</span>
+                    <span className="n-career-v">{v}</span>
+                  </span>
+                ))}
+              </div>
+
               <Section label="Record" sub={`${d.badges}/${ACHIEVEMENTS.length} · +${pct(TUNE.achieveBonus)} each, kept forever`} g={g} />
               <p className="n-note">
                 <button className="n-key tip-host" {...tipProps("badges", "The record", g.achieveTip())}>
@@ -2911,6 +3077,8 @@ export default function Mantle() {
           <span className="n-momentum">momentum ×{(1 + TUNE.momentumStep * s.momentum.n).toFixed(2)}</span>
         )}
       </button>
+
+      {g.rite && <Rite g={g} />}
 
       {g.tip && (
         <div
@@ -3193,6 +3361,33 @@ const CSS = `
 .n-log-line { margin: 0; font-size: 10.5px; opacity: .8; line-height: 1.35; }
 .n-log:not(.open) .n-log-line { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .n-log-t { display: inline-block; min-width: 42px; padding-right: 7px; opacity: .45; font-variant-numeric: tabular-nums; }
+/* ---- the ticker: the city's paper of record ---- */
+.n-ticker {
+  flex-shrink: 0; background: var(--ink); color: var(--paper);
+  border-top: 1px solid rgba(242,236,224,.25);
+  font-size: 9.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  padding: 2px 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .92;
+}
+
+/* ---- the rite: one keepsake from the estate ---- */
+.n-rite {
+  position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
+  background: rgba(23,22,20,.55); padding: 16px;
+}
+.n-rite-box {
+  background: var(--paper); border: 3px solid var(--ink); box-shadow: 6px 6px 0 var(--ink);
+  padding: 16px 18px 14px; max-width: 560px; width: 100%; max-height: 90vh; overflow-y: auto;
+}
+.n-rite-head { font-family: var(--head); font-size: 24px; letter-spacing: .04em; text-transform: uppercase; margin: 0 0 6px; }
+.n-rite-sub { font-size: 12px; opacity: .8; margin: 0 0 12px; }
+.n-rite-stay { display: block; margin: 12px auto 0; }
+
+/* ---- career stats ---- */
+.n-career { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 5px; margin-bottom: 12px; }
+.n-career-card { border: 1.5px solid var(--ink); background: #fff; box-shadow: 2px 2px 0 var(--ink); padding: 4px 8px 5px; }
+.n-career-k { display: block; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; opacity: .6; }
+.n-career-v { display: block; font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+
 /* ---- the bounty board & the stakeout ---- */
 .n-filled { border-style: dashed; opacity: .75; }
 .n-filled .n-count { background: var(--yellow); color: var(--ink); }
