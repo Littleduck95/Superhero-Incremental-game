@@ -5,6 +5,11 @@ A superhero incremental game: pick a hero, hold a city, get stronger.
 - **Region** — buildings produce leads, salvage and funding. Two of them,
   the Safehouse and the Training Floor, are opened by bosses and feed the
   fight instead: shorter recharges and stronger abilities.
+- **Marks** — every producing building doubles its output at 25 owned, then
+  50, 100, 200, 300, 400, and every 100 after that. The next mark is printed
+  on the building, so there is always a near goal worth buying toward and a
+  visible jump when you cross it. Storage, beds and the fight buildings keep
+  their own math and take no marks.
 - **Storage** — leads, salvage and funding all have a ceiling, and the
   Lockup is what raises it. Income stops dead at the ceiling; windfalls —
   boss bounties, gifts, a sale — are allowed over it. Nothing caps XP.
@@ -32,6 +37,32 @@ A superhero incremental game: pick a hero, hold a city, get stronger.
 - **Powers** — ranks bought with XP, multiplying region output and combat.
 - **Record** — achievements, each worth a little of everything, and the one
   thing besides legacy that survives passing the cowl on.
+- **Bounties** — the board opens with the first boss. Three contracts a day,
+  rolled at local midnight and scaled to your numbers when they roll; the
+  rewards are windfalls and go over the ceiling. Filling any one keeps the
+  day streak alive — +1% region per consecutive day up to +10%, kept through
+  passing the cowl on, gone if you skip a day — and clearing all three is
+  ×1.5 region for ten minutes. The tab also holds the **Stakeout**, a timing
+  minigame on a cooldown: start it, watch the marker sweep, move in when it
+  crosses the drop. Inside the window pays leads and funding, dead centre
+  pays triple, a miss pays nothing and comes back sooner.
+- **Flashpoints** — every few minutes of live play, something is happening
+  *right now*: a banner with a twenty-second countdown. Respond in time for
+  a windfall several times the size of a passive event, or read about what
+  you missed in the log. Like events, they never fire while you're away, so
+  leaving a tab open is not a strategy.
+- **Momentum** — chained Patrol taps build a multiplier, +5% a tap up to
+  ×2.5, dropped the moment you stop for a breath. Autopilot never touches
+  it; it's there for hands that want something to do.
+- **The estate** — passing the cowl on is a choice, not just a reset. Three
+  keepsakes are drawn from the old career's estate and the successor takes
+  one: power, resolve, leads, funding, crew output, XP a kill or recharge
+  speed. They are permanent, they stack if taken again, and nothing resets
+  until one is taken — so opening the estate and backing out costs nothing.
+  Every reset is a different build.
+- **The paper** — a headline ticker under the tabs, set by whatever the game
+  is actually doing: a boss standing up, full lockups, idle crew, a live
+  streak. Pure flavour, nothing saved.
 - **Tech** — a four-branch tree. Street makes the region richer and cheaper,
   Body opens the abilities and amplifies the fight, Mind amplifies the powers
   the region runs on and speeds recharge, and Ops unlocks the quality-of-life
@@ -52,20 +83,38 @@ Then open the URL Vite prints. `npm run build` writes a static bundle to `dist/`
 ## Checking it still works
 
 ```
-node scripts/sanity.mjs
+npm test
 ```
 
-Asserts the things that are easy to break and hard to notice: that a save
-from before crew, storage and projects existed still loads, that income
-stops at the ceiling while windfalls go over it, that unpaid crew leave
-instead of wedging the loop, that offline catch-up can't farm random
-events, and that every tech requirement points at a node that exists. It
-exits non-zero on the first thing that is wrong.
+Runs `scripts/sanity.mjs`, which drives the engine headlessly and asserts
+the things that are easy to break and hard to notice: that a save from
+before crew, storage and projects existed still loads, that a truncated or
+hand-edited save loads as a game instead of a crash, that income stops at
+the ceiling while windfalls go over it, that unpaid crew leave instead of
+wedging the loop, that a long catch-up keeps the kills it is owed, that
+offline catch-up can't farm random events or flashpoints, that the bounty
+board rolls, pays, streaks and lapses on the right days, that ownership
+marks land on producers only, that keepsakes apply and stack, and that
+every tech requirement points at a node that exists. It exits non-zero on
+the first thing that is wrong.
+
+```
+npm run test:ui
+```
+
+Builds the site and drives it in a real Chromium (`scripts/uitest.mjs`):
+the flashpoint banner pays and clears, patrol momentum shows, the board
+and streak render, a stakeout round resolves to a cooldown, a producer
+prints its next mark, and the estate rite hands a keepsake to a brand-new
+career that survives the reset. It seeds saves through `localStorage`
+before boot, starts and stops its own preview server, and fails on any
+uncaught page error. Set `CHROMIUM_PATH` if Playwright can't find a
+browser of its own.
 
 ## Checking the balance
 
 ```
-node scripts/balance.mjs [hours] [hero] [patrolRate]
+npm run balance -- [hours] [hero] [patrolRate]
 ```
 
 A greedy bot plays a career one second at a time, buying whatever is cheapest
@@ -87,7 +136,8 @@ promise, but if it can't beat a boss nobody can.
   hands back the exported `engine`, so the scripts below can drive the game
   from node without a DOM.
 - `scripts/balance.mjs` — the balance bot above.
-- `scripts/sanity.mjs` — the assertions above.
+- `scripts/sanity.mjs` — the engine assertions above.
+- `scripts/uitest.mjs` — the browser checks above.
 
 Progress saves every 10 seconds and when the tab is hidden. Offline progress is
 credited on load, capped at 8 hours (24 with the Archive tech) and capped again
@@ -98,7 +148,9 @@ farm them.
 Old saves load fine. Saves from before bosses existed count any district the old
 fight-count gate had opened as held; saves from before storage existed are handed
 enough lockups to hold what they already produce, so nobody comes back to a full
-city and no way to empty it.
+city and no way to empty it. A save that is damaged rather than merely old is
+scrubbed to sane numbers on the way in, and one that still won't parse is parked
+under `mantle:hero:v3:rescue` instead of being overwritten by the next autosave.
 
 ## Deploying
 

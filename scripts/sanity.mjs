@@ -67,7 +67,120 @@ ok("a 10% slice costs a tenth of the whole", Math.abs(E.projectCost(pr, 0, 0.1).
 const most = E.projectMax(w, pr, 1);
 ok("projectMax stays inside what is left", most > 0 && most <= 1, "max " + most.toFixed(3));
 
-/* 6. every tech, job and project id is sane and reachable */
+/* 6. flashpoints: quiet play never rolls one, and a live one expires */
+let fq = { ...E.migrate(null), hero: "grayline" };
+for (let t = 0; t < 3600; t++) fq = E.step(fq, 1, { quiet: true });
+ok("quiet play never rolls a flashpoint", !fq.flash);
+let fl = { ...E.migrate(null), hero: "grayline", flash: { id: "alarm", left: 5 } };
+fl = E.step(fl, 30, { quiet: true });
+ok("a flashpoint expires on its own", !fl.flash);
+ok("the miss makes the log", fl.log.some((l) => /vault/i.test(l.text)), JSON.stringify(fl.log));
+
+/* 7. the bounty board: rolls, pays, streaks, and turns over at midnight */
+let b = { ...E.migrate(null), hero: "grayline", bosses: { flats: true } };
+b = E.contractTick(b, 1000) || b;
+const eligible = E.CONTRACTS.filter((c) => !c.show || c.show(b, E.derive(b))).length;
+ok("the board rolls a full slate", b.contracts && b.contracts.day === 1000 && b.contracts.list.length === Math.min(E.TUNE.contractsADay, eligible), JSON.stringify(b.contracts));
+ok("contract ids are distinct", new Set(b.contracts.list.map((c) => c.id)).size === b.contracts.list.length);
+ok("goals and pays are positive", b.contracts.list.every((c) => c.goal > 0 && Object.values(c.pay).every((v) => v > 0)));
+ok("a fresh board changes nothing on the next tick", E.contractTick(b, 1000) === null);
+b.contracts.list[0] = { id: "shoeleather", base: b.patrols || 0, goal: 5, pay: { funding: 777 }, done: false };
+b.patrols = (b.patrols || 0) + 5;
+const fundedBefore = b.res.funding;
+b = E.contractTick(b, 1000) || b;
+ok("a filled bounty pays out over the ceiling", b.contracts.list[0].done && b.res.funding - fundedBefore >= 777, `+${b.res.funding - fundedBefore}`);
+ok("filling anything starts the streak", b.streak.days === 1 && b.streak.last === 1000, JSON.stringify(b.streak));
+const g0 = E.derive({ ...b, streak: { days: 0, last: 0 } }).global;
+const g5 = E.derive({ ...b, streak: { days: 5, last: 1000 } }).global;
+ok("the streak is worth region", g5 > g0, `${g0} vs ${g5}`);
+const b2 = E.contractTick(b, 1001) || b;
+ok("midnight turns the board over", b2.contracts.day === 1001 && b2.contracts.list.every((c) => !c.done));
+const b3 = E.contractTick(b, 1002) || b;
+ok("a skipped day lapses the streak", b3.streak.days === 0, "days " + b3.streak.days);
+for (const c of E.CONTRACTS) ok("contract metric exists: " + c.id, typeof E.METRICS[c.metric] === "function");
+for (const k in E.METRICS) ok("metric is finite on a fresh save: " + k, Number.isFinite(E.METRICS[k](E.freshState())));
+
+/* 8. midnight settles before it rolls: a goal crossed late still pays */
+let late = { ...E.migrate(null), hero: "grayline", bosses: { flats: true } };
+late = E.contractTick(late, 2000) || late;
+late.contracts = { day: 2000, list: [{ id: "shoeleather", base: 0, goal: 5, pay: { funding: 555 }, done: false }] };
+late.patrols = 5;
+const lateBefore = late.res.funding;
+late = E.contractTick(late, 2001) || late;
+ok("a stale board settles before rolling over", late.res.funding - lateBefore >= 555, `+${late.res.funding - lateBefore}`);
+ok("the late fill credits the day it was posted", late.streak.last === 2000 && late.streak.days === 1, JSON.stringify(late.streak));
+ok("and the new day's board still rolls", late.contracts.day === 2001);
+
+/* 9. goals never inflate off a passing boon */
+let boony = { ...E.migrate(null), hero: "grayline", bosses: { flats: true } };
+boony.own = { ...boony.own, watch: 10 };
+const calm = (E.contractTick({ ...boony, boon: null }, 3000) || boony).contracts;
+const hyped = (E.contractTick({ ...boony, boon: { id: "streak", mult: 2, left: 60 } }, 3000) || boony).contracts;
+const calmLedger = calm.list.find((c) => c.id === "ledger");
+const hypedLedger = hyped.list.find((c) => c.id === "ledger");
+if (calmLedger && hypedLedger)
+  ok("a live boon does not inflate goals", hypedLedger.goal === calmLedger.goal, `${hypedLedger.goal} vs ${calmLedger.goal}`);
+
+/* 10. a weaker boon never downgrades a stronger one */
+const strong = { id: "signal", mult: 2, left: 60 };
+const merged = E.mergeBoon(strong, { id: "board", mult: 1.5, left: 600 });
+ok("mergeBoon keeps the stronger multiplier", merged.mult === 2 && merged.left > 60, JSON.stringify(merged));
+ok("mergeBoon converts a weak boon at equal value", Math.abs(merged.left - 360) < 1e-9, "left " + merged.left);
+ok("mergeBoon upgrades to a stronger one", E.mergeBoon({ id: "quiet", mult: 1.35, left: 100 }, strong).mult === 2);
+ok("mergeBoon takes a boon when none is live", E.mergeBoon(null, strong).mult === 2);
+
+/* 11. a fast farmer's catch-up keeps its kills: with auto-fire disabling
+      the batch fast-path, the loop budget settles the remainder instead
+      of throwing hours of XP away */
+let farm = { ...E.migrate(null), hero: "grayline", district: "flats" };
+farm.gear = { ...farm.gear, rig: 2000, padding: 200 };
+farm.tech = { haymaker: true };
+const df = E.derive(farm, { auto: true });
+const farmed = E.step(farm, 3600, { quiet: true, auto: true });
+ok("a huge step keeps nearly all its kills", farmed.totalXP >= df.xpRate * 3600 * 0.8,
+  `${farmed.totalXP} of ~${Math.round(df.xpRate * 3600)}`);
+
+/* 12. offline catch-up goes through one shared policy */
+let nap = { ...E.migrate(null), hero: "kilowatt" };
+nap.own = { ...nap.own, perch: 20, yard: 20, watch: 20, lockup: 10 };
+const woke = E.catchUp(nap, 24 * 3600);
+ok("catchUp respects the ceiling", woke.res.salvage <= E.derive(woke).caps.salvage + 1e-6);
+ok("catchUp rolls no events or flashpoints", !woke.flash && !woke.log.some((l) => /payphone|envelope|witness|silent alarm/i.test(l.text)));
+
+/* 13. a garbage save loads as a game, not a crash or a NaN factory */
+const junk = E.migrate({ hero: "grayline", ranks: null, totalXP: undefined, res: { leads: "x" },
+  crew: { n: "9", jobs: "no" }, market: "abc", queue: {}, own: { perch: NaN }, streak: 7 });
+const dj = E.derive(junk);
+ok("garbage saves load finite", Number.isFinite(dj.global) && Number.isFinite(junk.res.leads) && Number.isFinite(junk.own.perch), JSON.stringify({ g: dj.global, leads: junk.res.leads }));
+ok("garbage queue becomes a list", Array.isArray(junk.queue));
+ok("garbage crew is countable", Number.isFinite(junk.crew.n) && Number.isFinite(junk.crew.jobs.beat));
+const junkStep = E.step(junk, 60, { quiet: true });
+ok("a scrubbed save steps cleanly", Number.isFinite(junkStep.res.funding) && Number.isFinite(junkStep.totalXP));
+
+/* 14. ownership marks double producers, and only producers */
+let ms = { ...E.migrate(null), hero: "grayline" };
+const at24 = E.derive({ ...ms, own: { ...ms.own, perch: 24 } }).gross.leads / 24;
+const at25 = E.derive({ ...ms, own: { ...ms.own, perch: 25 } }).gross.leads / 25;
+ok("the 25th perch doubles the lot", Math.abs(at25 / at24 - 2) < 1e-9, `${at24} -> ${at25}`);
+ok("marks count correctly", E.msCrossed(24) === 0 && E.msCrossed(25) === 1 && E.msCrossed(400) === 6 && E.msCrossed(500) === 7);
+ok("the next mark is always ahead", E.msNext(0) === 25 && E.msNext(25) === 50 && E.msNext(400) === 500 && E.msNext(650) === 700);
+const capsAt = (n) => E.derive({ ...ms, own: { ...ms.own, lockup: n } }).caps.funding;
+ok("lockups take no marks", Math.abs((capsAt(25) - capsAt(24)) - (capsAt(24) - capsAt(23))) < 2, "storage steps stay even");
+
+/* 15. keepsakes apply, stack, and survive the numbers */
+const bare = E.derive({ ...ms, own: { ...ms.own, perch: 10 } });
+const kitted = E.derive({ ...ms, own: { ...ms.own, perch: 10 }, keepsakes: { bag: 1, cowl: 1, frequencies: 2 } });
+ok("keepsakes raise power and resolve", Math.abs(kitted.power / bare.power - 1.2) < 1e-9 && Math.abs(kitted.resolve / bare.resolve - 1.25) < 1e-9);
+ok("keepsakes stack per copy", Math.abs(kitted.gross.leads / bare.gross.leads - 1.4) < 1e-9, `${kitted.gross.leads / bare.gross.leads}`);
+ok("every keepsake id is distinct", new Set(E.KEEPSAKES.map((k) => k.id)).size === E.KEEPSAKES.length);
+const junkKeep = E.migrate({ hero: "grayline", keepsakes: { bag: "x", clock: -30, cowl: 2.7, nonesuch: 5 }, estate: { picks: ["bag", "made-up"] } });
+ok("junk keepsake counts are scrubbed", junkKeep.keepsakes.bag === 0 && junkKeep.keepsakes.clock === 0 && junkKeep.keepsakes.cowl === 2);
+const dk = E.derive(junkKeep);
+ok("a junk estate can't poison the stats", Number.isFinite(dk.power) && Number.isFinite(dk.resolve) && Number.isFinite(dk.cdMult) && dk.cdMult > 0);
+ok("an unknown keepsake is ignored", Number.isFinite(dk.kpCount) && dk.kpCount === 2, "count " + dk.kpCount);
+ok("a drawn estate keeps only real ids", junkKeep.estate.picks.join() === "bag", junkKeep.estate.picks.join());
+
+/* 16. every tech, job and project id is sane and reachable */
 const ids = new Set();
 for (const t of E.TECH) { ok("tech id unique: " + t.id, !ids.has(t.id)); ids.add(t.id); }
 for (const t of E.TECH) for (const r of t.req) ok(`${t.id} requires a real node`, ids.has(r), r);
