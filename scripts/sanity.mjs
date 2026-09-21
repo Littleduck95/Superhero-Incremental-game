@@ -225,7 +225,61 @@ for (let t = 0; t < 120; t++) chosen = E.step(chosen, 1, { quiet: true });
 ok("the tick keeps the player's assignment", chosen.crew.jobs.sparring >= 8, JSON.stringify(chosen.crew.jobs));
 ok("new hands still put themselves to work", E.crewSplit(chosen).idle === 0, "idle " + E.crewSplit(chosen).idle);
 
-/* 17. every tech, job and project id is sane and reachable */
+/* 17. the XP readout has to match the fight it is describing, and the
+      batched settle has to pay what simulating every kill would. A hit
+      is worth one kill however big it lands, so counting a Training
+      Floor's whole overkill had the readout — and the catch-up that
+      settles off it — promising kills the fight could never deliver. */
+const fighter = (terr, gear, rank, gym, district) => {
+  const f = { ...E.migrate(null), hero: "grayline" };
+  for (const t of E.TERRITORY) f.own[t.id] = terr;
+  f.own.gym = gym;
+  for (const gi of E.GEAR) f.gear[gi.id] = gear;
+  for (const pw of E.POWERS) f.ranks[pw.id] = rank;
+  f.res = { leads: 9e12, salvage: 9e12, funding: 9e14, xp: 9e9 };
+  f.totalXP = 1e7;
+  for (const dist of E.DISTRICTS) f.bosses[dist.id] = true;
+  for (const a of E.ABILITIES) f.tech[a.tech] = true;
+  f.tech.triggers = true;
+  f.district = district;
+  return f;
+};
+const ranAt = (f, slices) => {
+  let b = f;
+  for (let i = 0; i < slices; i++) b = E.step(b, 1, { quiet: true });
+  return Object.values(b.cleared).reduce((a, c) => a + c, 0);
+};
+for (const [label, f] of [["mid", fighter(25, 15, 10, 4, "docks")], ["endgame", fighter(120, 80, 40, 120, "docks")]]) {
+  const dd = E.derive(f);
+  const promised = 1 / dd.ttkEff;
+  const real = ranAt(f, 20) / 20;
+  ok(`the XP readout matches the fight (${label})`, real > promised * 0.6 && real < promised * 1.5,
+    `promised ${promised.toFixed(1)}/s, ran at ${real.toFixed(1)}/s`);
+}
+/* the batch is a shortcut, not a payout: it must land where the full
+   simulation lands */
+const batched = fighter(120, 80, 40, 120, "flats");
+const withBatch = ranAt(batched, 30);
+const realBatch = E.TUNE.killBatch;
+E.TUNE.killBatch = Infinity;
+const without = ranAt(batched, 30);
+E.TUNE.killBatch = realBatch;
+ok("the batched settle pays what simulating every kill pays",
+  Math.abs(withBatch - without) <= without * 0.02, `${withBatch} vs ${without}`);
+/* The shortcut is for trash only: a boss is one foe, and settling one at
+   the trash rate would hand out a district's worth of kills a second.
+   The Broker outlasts a slice for this hero, so while he is up nothing
+   else should be dying. */
+const bossOn = { ...fighter(12, 6, 4, 1, "midtown"), cleared: {} };
+const bossFight = { ...bossOn, fight: E.startBoss(E.derive(bossOn)) };
+const afterBoss = E.step(bossFight, 1, { quiet: true });
+ok("a boss holds the fight for the whole slice", afterBoss.fight.boss === true, JSON.stringify(afterBoss.fight).slice(0, 90));
+ok("no trash is settled while a boss is up", (afterBoss.cleared.midtown || 0) === 0, "kills " + afterBoss.cleared.midtown);
+ok("the boss fight is simulated, both ways", afterBoss.fight.enemyHP < bossFight.fight.enemyHP
+  && afterBoss.fight.heroHP < bossFight.fight.heroHP,
+  `boss ${bossFight.fight.enemyHP} -> ${afterBoss.fight.enemyHP}, hero ${bossFight.fight.heroHP} -> ${afterBoss.fight.heroHP}`);
+
+/* 18. every tech, job and project id is sane and reachable */
 const ids = new Set();
 for (const t of E.TECH) { ok("tech id unique: " + t.id, !ids.has(t.id)); ids.add(t.id); }
 for (const t of E.TECH) for (const r of t.req) ok(`${t.id} requires a real node`, ids.has(r), r);

@@ -385,6 +385,7 @@ const TUNE = {
   safehouseEach: 0.05,   /* cooldowns divided by 1 + this per safehouse */
   gymEach: 0.08,         /* ability magnitude and duration, per floor */
   bossSimSeconds: 600,
+  killBatch: 200,        /* kills in one slice past which the fight is settled, not simulated */
   capBase: { leads: 900, salvage: 900, funding: 500 },
   capEach: { leads: 2600, salvage: 2600, funding: 1300 },
   capHeld: 0.25,          /* storage per district held */
@@ -783,17 +784,23 @@ function derive(s, opts = {}) {
   });
   const auto = !!tech.triggers || !!opts.auto;
 
+  const dist = distById(s.district);
+
   /* What auto-fire adds on average, for the readouts. The survival test
      stays on raw stats: bursts are lumpy and a fight shorter than a
-     cooldown can't count on one. */
+     cooldown can't count on one.
+       A hit is worth at most one kill, however big it lands: the fight is
+     one foe at a time and a new one comes up at full health, so counting
+     a Training-Floor Haymaker's whole eight-thousand-fold overkill had
+     the XP readout — and the catch-up that settles off it — promising
+     twenty-five times the kills the fight could ever deliver. */
   let burst = 0;
   for (const a of abilities) {
-    if (a.kind === "hit") burst += a.amount / a.cd;
+    if (a.kind === "hit") burst += Math.min(a.amount, dist.hp) / a.cd;
     else if (a.kind === "boost") burst += power * (a.mag - 1) * a.dur / a.cd;
   }
   const sustain = auto ? power + burst : power;
 
-  const dist = distById(s.district);
   const ttk = power > 0 ? dist.hp / power : Infinity;
   const damageTaken = dist.dps * ttk;
   const winnable = damageTaken < resolve;
@@ -913,6 +920,24 @@ function combatStep(s, dt, d) {
     heroHP = d.resolve;
   };
 
+  /* Settling a slice at the rate the readouts advertise. The remainder of
+     an exhausted loop comes through here, and so does a slice with more
+     kills in it than the loop could ever resolve — simulating five
+     thousand identical one-shot kills only to hand the rest to this same
+     formula burned a fortieth of a second a tick and changed nothing. */
+  const settle = (secs) => {
+    const n = Math.floor(secs / d.ttkEff);
+    if (n <= 0) return false;
+    kills += n;
+    xp += n * dist.xp * d.xpMult;
+    tick(secs);
+    enemyHP = foeHP();
+    heroHP = d.resolve;
+    return true;
+  };
+  const settleable = !isBoss && ko <= 0 && d.winnable && d.ttkEff > 0 && Number.isFinite(d.ttkEff);
+  if (settleable && t / d.ttkEff >= TUNE.killBatch && settle(t)) t = 0;
+
   while (t > 1e-9 && guard++ < 5000) {
     if (ko > 0) {
       const spend = Math.min(t, ko);
@@ -964,19 +989,9 @@ function combatStep(s, dt, d) {
   }
   /* A huge catch-up in a district that dies in milliseconds can exhaust
      the loop budget with time still on the clock. Settle the remainder
-     statistically at the same rate the readouts advertise — throwing the
-     hours away punished exactly the players farming fast kills. */
-  if (t > 1e-9 && !isBoss && d.winnable && d.ttkEff > 0 && Number.isFinite(d.ttkEff)) {
-    const n = Math.floor(t / d.ttkEff);
-    if (n > 0) {
-      kills += n;
-      xp += n * dist.xp * d.xpMult;
-      tick(t);
-      t = 0;
-      enemyHP = foeHP();
-      heroHP = d.resolve;
-    }
-  }
+     the same way — throwing the hours away punished exactly the players
+     farming fast kills. */
+  if (t > 1e-9 && !isBoss && d.winnable && d.ttkEff > 0 && Number.isFinite(d.ttkEff) && settle(t)) t = 0;
   return { fight: { ...f, enemyHP, heroHP, ko, boss: isBoss, cd, buff, cast: [] }, xp, kills, bossWin, heroAtWin };
 }
 
