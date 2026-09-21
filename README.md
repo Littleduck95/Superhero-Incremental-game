@@ -18,7 +18,11 @@ A superhero incremental game: pick a hero, hold a city, get stronger.
 - **Crew** — safehouses are beds, beds are the only reason anyone stays,
   and people walk in on their own while there is room. Five jobs: three
   feed the region, Sparring feeds power and resolve, and the Intel Desk
-  raises XP a kill. Payroll comes out of funding every second and climbs
+  raises XP a kill. New hands put themselves to work on the way in, so
+  the outfit is rarely idle — and you can still move anyone at any time:
+  `+` spends an idle hand where there is one and pulls off the fullest
+  job where there isn't, `all` puts the whole outfit on one job, `−`
+  stands one down. Payroll comes out of funding every second and climbs
   steeply with the size of the outfit; miss it long enough and somebody
   hands their key back.
 - **Black market** — leads and salvage move for funding. Dumping a pile
@@ -91,12 +95,14 @@ the things that are easy to break and hard to notice: that a save from
 before crew, storage and projects existed still loads, that a truncated or
 hand-edited save loads as a game instead of a crash, that income stops at
 the ceiling while windfalls go over it, that unpaid crew leave instead of
-wedging the loop, that a long catch-up keeps the kills it is owed, that
-offline catch-up can't farm random events or flashpoints, that the bounty
-board rolls, pays, streaks and lapses on the right days, that ownership
-marks land on producers only, that keepsakes apply and stack, and that
-every tech requirement points at a node that exists. It exits non-zero on
-the first thing that is wrong.
+wedging the loop, that a hand can always be moved between jobs, that the
+XP-a-second readout matches the fight it is describing and that the
+batched settle pays what simulating every kill pays, that a long catch-up
+keeps the kills it is owed, that offline catch-up can't farm random events
+or flashpoints, that the bounty board rolls, pays, streaks and lapses on
+the right days, that ownership marks land on producers only, that
+keepsakes apply and stack, and that every tech requirement points at a
+node that exists. It runs every check and exits non-zero if any failed.
 
 ```
 npm run test:ui
@@ -105,8 +111,10 @@ npm run test:ui
 Builds the site and drives it in a real Chromium (`scripts/uitest.mjs`):
 the flashpoint banner pays and clears, patrol momentum shows, the board
 and streak render, a stakeout round resolves to a cooldown, a producer
-prints its next mark, and the estate rite hands a keepsake to a brand-new
-career that survives the reset. It seeds saves through `localStorage`
+prints its next mark, a hand moves between crew jobs with nobody idle,
+the 1-4 keys fire abilities from the fight tab and nowhere else, and the
+estate rite hands a keepsake to a brand-new career that survives the
+reset. It seeds saves through `localStorage`
 before boot, starts and stops its own preview server, and fails on any
 uncaught page error. Set `CHROMIUM_PATH` if Playwright can't find a
 browser of its own.

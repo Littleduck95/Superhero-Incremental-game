@@ -1,7 +1,7 @@
 /* Sanity checks for the engine: old saves, the storage ceiling, crew
    payroll, offline catch-up, project slices and the content tables.
      node scripts/sanity.mjs
-   Exits non-zero on the first thing that is wrong. This is not a balance
+   Runs every check and exits non-zero if any of them failed. This is not a balance
    check — balance.mjs is — it only asserts that nothing is broken. */
 import { E } from "./engine.mjs";
 
@@ -156,6 +156,57 @@ ok("garbage queue becomes a list", Array.isArray(junk.queue));
 ok("garbage crew is countable", Number.isFinite(junk.crew.n) && Number.isFinite(junk.crew.jobs.beat));
 const junkStep = E.step(junk, 60, { quiet: true });
 ok("a scrubbed save steps cleanly", Number.isFinite(junkStep.res.funding) && Number.isFinite(junkStep.totalXP));
+/* a project is a count and a slice, and both feed multipliers on
+   everything: junk in either used to turn the whole game into NaN */
+const junkWorks = E.migrate({ hero: "grayline", tech: { projects: true },
+  projects: { beacon: { done: "x", prog: "y" }, ward: { done: -4, prog: 9 }, spire: 7, nonesuch: { done: 3 } } });
+const dw = E.derive(junkWorks);
+ok("a junk project can't NaN the game", [dw.global, dw.power, dw.resolve, dw.caps.leads, dw.gross.funding].every(Number.isFinite),
+  JSON.stringify({ g: dw.global, p: dw.power, cap: dw.caps.leads }));
+ok("a junk project slice is clamped inside the next one", E.projectAt(junkWorks, E.PROJECTS.find((p) => p.id === "ward")).prog < 1);
+ok("an unknown project is dropped", !("nonesuch" in junkWorks.projects) && !("spire" in junkWorks.projects), JSON.stringify(junkWorks.projects));
+/* the career counters multiply the region and set the ceilings: a save
+   claiming negative legacy ran every one of them backwards */
+const junkCareer = E.migrate({ hero: "grayline", legacy: -1000, totalXP: -5e6, careerFunding: -1e9,
+  traded: -7, patrols: -3, runs: -2, time: -50, streak: { days: -50, last: -9 } });
+const dc = E.derive(junkCareer);
+ok("a negative career can't run the region backwards", dc.global > 0 && dc.caps.leads > 0 && dc.patrol > 0,
+  `global ${dc.global} caps ${dc.caps.leads} patrol ${dc.patrol}`);
+ok("and the counters themselves are scrubbed",
+  junkCareer.legacy === 0 && junkCareer.totalXP === 0 && junkCareer.careerFunding === 0 && junkCareer.streak.days === 0);
+/* crewSplit clamps on read, but the tick works the raw map */
+const junkJobs = E.migrate({ hero: "grayline", crew: { n: 5, jobs: { beat: -4, scavenge: 2.7 } } });
+ok("junk crew assignments are scrubbed at load",
+  junkJobs.crew.jobs.beat === 0 && junkJobs.crew.jobs.scavenge === 2, JSON.stringify(junkJobs.crew.jobs));
+/* an invalid slice is not progress: clamping it up handed over a project */
+const junkProg = E.migrate({ hero: "grayline", projects: { ward: { done: -4, prog: 9 } } });
+ok("an impossible project slice is not free progress", E.projectAt(junkProg, E.PROJECTS.find((p) => p.id === "ward")).prog === 0,
+  JSON.stringify(junkProg.projects));
+const keptProg = E.migrate({ hero: "grayline", projects: { ward: { done: 2, prog: 0.4 } } });
+ok("a real project slice is kept", keptProg.projects.ward.done === 2 && Math.abs(keptProg.projects.ward.prog - 0.4) < 1e-9);
+
+/* migrate scrubs in place, so the state it returns must be its own */
+const shared = { hero: "grayline", ranks: { impact: 3.7 }, cleared: { flats: 9.2 }, keepsakes: { bag: 2.5 }, queue: [], log: [] };
+const migrated = E.migrate(shared);
+ok("migrate never writes back through the save it was handed",
+  shared.ranks.impact === 3.7 && shared.cleared.flats === 9.2 && shared.keepsakes.bag === 2.5,
+  JSON.stringify({ r: shared.ranks, c: shared.cleared, k: shared.keepsakes }));
+ok("and shares no mutable part of it",
+  migrated.ranks !== shared.ranks && migrated.cleared !== shared.cleared
+  && migrated.keepsakes !== shared.keepsakes && migrated.queue !== shared.queue && migrated.log !== shared.log);
+
+/* nothing you hold runs backwards */
+const junkNeg = E.migrate({ hero: "grayline", res: { leads: -500, funding: -1e9 }, own: { perch: -20, lockup: 2.7 }, gear: { rig: -8 }, ranks: { impact: -3 } });
+ok("negative holdings are scrubbed", junkNeg.res.leads === 0 && junkNeg.own.perch === 0 && junkNeg.gear.rig === 0 && junkNeg.ranks.impact === 0);
+ok("fractional holdings are whole", junkNeg.own.lockup === 2);
+/* the bisecting max-buy has to land where walking the costs landed */
+for (const item of [...E.TERRITORY, ...E.GEAR]) {
+  const res = { leads: 4e6, salvage: 4e6, funding: 4e6, xp: 4e6 };
+  let walked = 0;
+  while (walked < 1000 && E.canPay(E.costOf(item, 7, walked + 1, 1), res)) walked++;
+  ok("max buy bisects to the same count: " + item.id, E.maxAffordable(item, 7, res, 1) === walked,
+    `${E.maxAffordable(item, 7, res, 1)} vs ${walked}`);
+}
 
 /* 14. ownership marks double producers, and only producers */
 let ms = { ...E.migrate(null), hero: "grayline" };
@@ -180,7 +231,141 @@ ok("a junk estate can't poison the stats", Number.isFinite(dk.power) && Number.i
 ok("an unknown keepsake is ignored", Number.isFinite(dk.kpCount) && dk.kpCount === 2, "count " + dk.kpCount);
 ok("a drawn estate keeps only real ids", junkKeep.estate.picks.join() === "bag", junkKeep.estate.picks.join());
 
-/* 16. every tech, job and project id is sane and reachable */
+/* 16. the crew board: a hand can always be moved, idle or not. Crew put
+      themselves to work the moment they walk in, so a board that could
+      only spend idle hands was a board nobody could ever use. */
+const outfit = (n, jobs) => ({
+  ...E.migrate(null), hero: "grayline",
+  own: { ...E.freshState().own, safehouse: 4 },
+  crew: { n, grow: 0, unpaid: 0, jobs: { beat: 0, scavenge: 0, outreach: 0, sparring: 0, intel: 0, ...jobs } },
+});
+const sum = (jobs) => E.JOBS.reduce((t, j) => t + (jobs[j.id] || 0), 0);
+
+const packed = outfit(8, { beat: 8 });
+ok("nobody is idle with the whole outfit on one job", E.crewSplit(packed).idle === 0);
+let moved = E.assignCrew(packed, "scavenge", 1);
+ok("+ moves a hand with nobody idle", moved && moved.scavenge === 1 && moved.beat === 7, JSON.stringify(moved));
+ok("+ moves one hand, not two", moved && sum(moved) === 8, JSON.stringify(moved));
+
+const evened = outfit(8, { beat: 5, scavenge: 3 });
+ok("+ pulls off the fullest job", E.assignCrew(evened, "intel", 1).beat === 4);
+ok("all takes the whole outfit", sum(E.assignCrew(evened, "outreach", "max")) === 8 && E.assignCrew(evened, "outreach", "max").outreach === 8);
+ok("none stands a job down", E.assignCrew(evened, "beat", "none").beat === 0);
+ok("- frees a hand rather than moving one", E.assignCrew(evened, "beat", -1).beat === 4 && sum(E.assignCrew(evened, "beat", -1)) === 7);
+
+ok("+ on a job that already holds everyone is a no-op", E.assignCrew(packed, "beat", 1) === null);
+ok("all on a job that already holds everyone is a no-op", E.assignCrew(packed, "beat", "max") === null);
+ok("- on an empty job is a no-op", E.assignCrew(packed, "intel", -1) === null);
+ok("an empty outfit has nothing to move", E.assignCrew(outfit(0, {}), "beat", 1) === null && E.assignCrew(outfit(0, {}), "beat", "max") === null);
+
+const idling = outfit(8, { beat: 2 });
+ok("idle hands go first", E.assignCrew(idling, "intel", 1).beat === 2 && E.assignCrew(idling, "intel", 1).intel === 1);
+ok("all sweeps up the idle too", E.assignCrew(idling, "intel", "max").intel === 8);
+
+/* an overstuffed save (a safehouse lost, a hand walked) is clamped on read,
+   and a move off it can never conjure people who left */
+const overstuffed = outfit(3, { beat: 9, scavenge: 4 });
+ok("a stale assignment is clamped before it is moved", sum(E.assignCrew(overstuffed, "intel", "max")) === 3);
+ok("clamped moves keep the outfit whole", E.assignCrew(overstuffed, "intel", 1) && sum(E.assignCrew(overstuffed, "intel", 1)) === 3);
+
+/* the tick must not undo the player: a choice survives live play */
+let chosen = outfit(8, { beat: 8 });
+chosen = { ...chosen, crew: { ...chosen.crew, jobs: E.assignCrew(chosen, "sparring", "max") } };
+chosen.res = { leads: 0, salvage: 0, funding: 1e9, xp: 0 };
+for (let t = 0; t < 120; t++) chosen = E.step(chosen, 1, { quiet: true });
+ok("the tick keeps the player's assignment", chosen.crew.jobs.sparring >= 8, JSON.stringify(chosen.crew.jobs));
+ok("new hands still put themselves to work", E.crewSplit(chosen).idle === 0, "idle " + E.crewSplit(chosen).idle);
+
+/* 17. the XP readout has to match the fight it is describing, and the
+      batched settle has to pay what simulating every kill would. A hit
+      is worth one kill however big it lands, so counting a Training
+      Floor's whole overkill had the readout — and the catch-up that
+      settles off it — promising kills the fight could never deliver. */
+const fighter = (terr, gear, rank, gym, district) => {
+  const f = { ...E.migrate(null), hero: "grayline" };
+  for (const t of E.TERRITORY) f.own[t.id] = terr;
+  f.own.gym = gym;
+  for (const gi of E.GEAR) f.gear[gi.id] = gear;
+  for (const pw of E.POWERS) f.ranks[pw.id] = rank;
+  f.res = { leads: 9e12, salvage: 9e12, funding: 9e14, xp: 9e9 };
+  f.totalXP = 1e7;
+  for (const dist of E.DISTRICTS) f.bosses[dist.id] = true;
+  for (const a of E.ABILITIES) f.tech[a.tech] = true;
+  f.tech.triggers = true;
+  f.district = district;
+  return f;
+};
+const ranAt = (f, slices) => {
+  let b = f;
+  for (let i = 0; i < slices; i++) b = E.step(b, 1, { quiet: true });
+  return Object.values(b.cleared).reduce((a, c) => a + c, 0);
+};
+/* The readout check has to simulate every kill, or it compares ttkEff
+   against kills the settle awarded off ttkEff and can never fail. */
+const realBatch0 = E.TUNE.killBatch, realSteps0 = E.TUNE.fightSteps;
+for (const [label, f] of [["mid", fighter(25, 15, 10, 4, "docks")], ["endgame", fighter(120, 80, 40, 120, "docks")]]) {
+  const dd = E.derive(f);
+  const promised = 1 / dd.ttkEff;
+  E.TUNE.killBatch = Infinity;
+  E.TUNE.fightSteps = 1e9;
+  const real = ranAt(f, 20) / 20;
+  E.TUNE.killBatch = realBatch0;
+  E.TUNE.fightSteps = realSteps0;
+  ok(`the XP readout matches the fight (${label})`, real > promised * 0.6 && real < promised * 1.5,
+    `promised ${promised.toFixed(1)}/s, ran at ${real.toFixed(1)}/s`);
+}
+/* A tap is the player's move and the shortcut must not swallow it: the
+   settle skipped the ability loop outright, so in a fast enough fight a
+   tapped ability did nothing at all — no damage, no buff, no cooldown. */
+const tapper = fighter(120, 80, 40, 120, "flats");
+const tappedIn = { ...tapper, fight: { ...tapper.fight, cast: ["surge"] } };
+const realBatch1 = E.TUNE.killBatch, realSteps1 = E.TUNE.fightSteps;
+const tappedOut = E.step(tappedIn, 1, { quiet: true });
+E.TUNE.killBatch = Infinity;
+E.TUNE.fightSteps = 1e9;
+const tappedFull = E.step(tappedIn, 1, { quiet: true });
+E.TUNE.killBatch = realBatch1;
+E.TUNE.fightSteps = realSteps1;
+ok("a tapped ability fires even in a settled slice", (tappedOut.fight.cd.surge || 0) > 0,
+  `cd ${JSON.stringify(tappedOut.fight.cd)} buff ${JSON.stringify(tappedOut.fight.buff)}`);
+ok("and fires exactly as it would if every kill were simulated",
+  Math.abs((tappedOut.fight.cd.surge || 0) - (tappedFull.fight.cd.surge || 0)) < 1e-6,
+  `${tappedOut.fight.cd.surge} vs ${tappedFull.fight.cd.surge}`);
+
+/* the cut-over is a rate, so it must not move with the slice length */
+const rated = fighter(120, 80, 40, 120, "docks");
+const perSlice = [0.1, 1, 60].map((dt) => {
+  let b = rated;
+  for (let i = 0; i < 60 / dt; i++) b = E.step(b, dt, { quiet: true });
+  return Object.values(b.cleared).reduce((a, c) => a + c, 0);
+});
+ok("60 seconds pays the same however it is sliced",
+  perSlice.every((v) => Math.abs(v - perSlice[0]) <= perSlice[0] * 0.05), perSlice.join(" / "));
+
+/* the batch is a shortcut, not a payout: it must land where the full
+   simulation lands */
+const batched = fighter(120, 80, 40, 120, "flats");
+const withBatch = ranAt(batched, 30);
+const realBatch = E.TUNE.killBatch;
+E.TUNE.killBatch = Infinity;
+const without = ranAt(batched, 30);
+E.TUNE.killBatch = realBatch;
+ok("the batched settle pays what simulating every kill pays",
+  Math.abs(withBatch - without) <= without * 0.02, `${withBatch} vs ${without}`);
+/* The shortcut is for trash only: a boss is one foe, and settling one at
+   the trash rate would hand out a district's worth of kills a second.
+   The Broker outlasts a slice for this hero, so while he is up nothing
+   else should be dying. */
+const bossOn = { ...fighter(12, 6, 4, 1, "midtown"), cleared: {} };
+const bossFight = { ...bossOn, fight: E.startBoss(E.derive(bossOn)) };
+const afterBoss = E.step(bossFight, 1, { quiet: true });
+ok("a boss holds the fight for the whole slice", afterBoss.fight.boss === true, JSON.stringify(afterBoss.fight).slice(0, 90));
+ok("no trash is settled while a boss is up", (afterBoss.cleared.midtown || 0) === 0, "kills " + afterBoss.cleared.midtown);
+ok("the boss fight is simulated, both ways", afterBoss.fight.enemyHP < bossFight.fight.enemyHP
+  && afterBoss.fight.heroHP < bossFight.fight.heroHP,
+  `boss ${bossFight.fight.enemyHP} -> ${afterBoss.fight.enemyHP}, hero ${bossFight.fight.heroHP} -> ${afterBoss.fight.heroHP}`);
+
+/* 18. every tech, job and project id is sane and reachable */
 const ids = new Set();
 for (const t of E.TECH) { ok("tech id unique: " + t.id, !ids.has(t.id)); ids.add(t.id); }
 for (const t of E.TECH) for (const r of t.req) ok(`${t.id} requires a real node`, ids.has(r), r);

@@ -385,6 +385,8 @@ const TUNE = {
   safehouseEach: 0.05,   /* cooldowns divided by 1 + this per safehouse */
   gymEach: 0.08,         /* ability magnitude and duration, per floor */
   bossSimSeconds: 600,
+  killBatch: 200,        /* kills a second past which a fight is settled, not simulated */
+  fightSteps: 5000,      /* event boundaries one combat slice may resolve before it is settled */
   capBase: { leads: 900, salvage: 900, funding: 500 },
   capEach: { leads: 2600, salvage: 2600, funding: 1300 },
   capHeld: 0.25,          /* storage per district held */
@@ -502,7 +504,15 @@ function migrate(saved) {
     autosell: { ...st.autosell },
     projects: { ...st.projects },
     achieved: { ...st.achieved },
-    log: Array.isArray(st.log) ? st.log : [],
+    /* every branch below scrubs these in place, so they have to be this
+       state's own: taken straight off `st` the scrub wrote back through
+       the save it was handed, and the two states shared the objects
+       afterwards. Everything else here is copied for the same reason. */
+    ranks: { ...st.ranks },
+    cleared: { ...st.cleared },
+    keepsakes: { ...st.keepsakes },
+    queue: Array.isArray(st.queue) ? [...st.queue] : [],
+    log: Array.isArray(st.log) ? [...st.log] : [],
     tech: { ...st.tech },
     bosses: { ...st.bosses },
   };
@@ -523,14 +533,34 @@ function migrate(saved) {
      NaN factory. The loader parks a save that still won't load under a
      rescue key rather than letting the autosave pave over it. */
   const num = (v, d0 = 0) => (Number.isFinite(v) ? v : d0);
+  /* nothing you hold is negative or fractional, and a save that says
+     otherwise would run the region backwards rather than fail loudly */
+  const count = (v) => Math.max(0, Math.floor(num(v)));
   for (const k of ["ranks", "tech", "cleared", "bosses", "projects", "autosell", "achieved", "keepsakes"])
     if (!back[k] || typeof back[k] !== "object" || Array.isArray(back[k])) back[k] = {};
   if (!Array.isArray(back.queue)) back.queue = [];
-  for (const k of RES_IDS) back.res[k] = num(back.res[k]);
-  for (const t of TERRITORY) back.own[t.id] = num(back.own[t.id]);
-  for (const gi of GEAR) back.gear[gi.id] = num(back.gear[gi.id]);
-  for (const k in back.ranks) back.ranks[k] = num(back.ranks[k]);
-  for (const k in back.cleared) back.cleared[k] = num(back.cleared[k]);
+  for (const k of RES_IDS) back.res[k] = Math.max(0, num(back.res[k]));
+  for (const t of TERRITORY) back.own[t.id] = count(back.own[t.id]);
+  for (const gi of GEAR) back.gear[gi.id] = count(back.gear[gi.id]);
+  for (const k in back.ranks) back.ranks[k] = count(back.ranks[k]);
+  for (const k in back.cleared) back.cleared[k] = count(back.cleared[k]);
+  /* A project is a count of completions and a slice of the next one, and
+     both feed multipliers on everything. A junk one turned the whole
+     game — power, resolve, income, storage — into NaN on load, which is
+     exactly what the scrub above exists to prevent. */
+  const works = {};
+  for (const pr of PROJECTS) {
+    const at = back.projects[pr.id];
+    if (!at || typeof at !== "object") continue;
+    const done = count(at.done);
+    /* a slice is a share of the next completion: anything outside [0, 1)
+       was never a real slice, and clamping it upwards would hand over a
+       virtually finished project for a rounding error */
+    const raw = num(at.prog);
+    const prog = raw > 0 && raw < 1 ? raw : 0;
+    if (done || prog) works[pr.id] = { done, prog };
+  }
+  back.projects = works;
   /* keepsake counts multiply combat and income, so a junk or negative
      one would poison every stat rather than merely miscount */
   for (const k in back.keepsakes) back.keepsakes[k] = Math.max(0, Math.floor(num(back.keepsakes[k])));
@@ -538,13 +568,19 @@ function migrate(saved) {
     ? { picks: back.estate.picks.filter((id) => KEEPSAKES.some((k) => k.id === id)) }
     : null;
   for (const m of MARKET) back.market[m.id] = num(back.market[m.id], 1);
-  for (const k of ["time", "totalXP", "legacy", "careerFunding", "allTimeFunding", "traded", "patrols", "stakeoutAt", "runs"])
-    back[k] = num(back[k]);
-  back.crew.n = Math.max(0, Math.floor(num(back.crew.n)));
-  back.crew.grow = num(back.crew.grow);
-  back.crew.unpaid = num(back.crew.unpaid);
-  for (const j of JOBS) back.crew.jobs[j.id] = num(back.crew.jobs[j.id]);
-  back.streak = { days: num(back.streak.days), last: num(back.streak.last) };
+  /* The career counters only ever go up, and half of them multiply the
+     whole region: a save claiming -1000 legacy loaded as written ran
+     every multiplier and every storage ceiling negative. */
+  for (const k of ["time", "totalXP", "careerFunding", "allTimeFunding", "traded", "stakeoutAt"])
+    back[k] = Math.max(0, num(back[k]));
+  for (const k of ["legacy", "patrols", "runs"]) back[k] = count(back[k]);
+  back.crew.n = count(back.crew.n);
+  back.crew.grow = Math.max(0, num(back.crew.grow));
+  back.crew.unpaid = Math.max(0, num(back.crew.unpaid));
+  /* crewSplit clamps assignments on read, but the tick works the raw map:
+     a negative or fractional job would otherwise ride the whole session */
+  for (const j of JOBS) back.crew.jobs[j.id] = count(back.crew.jobs[j.id]);
+  back.streak = { days: count(back.streak.days), last: count(back.streak.last) };
   return back;
 }
 
@@ -586,6 +622,39 @@ function crewSplit(s) {
     used += got;
   }
   return { jobs, n, idle: n - used };
+}
+
+/* Putting a hand on a job. Crew put themselves to work the moment they
+   walk in, so idle is nearly always zero: if a move could only spend an
+   idle hand, the board would sit frozen for the whole game. So take an
+   idle one where there is one and pull off the fullest other job where
+   there isn't — one at a time, so filling a job drains the crowd rather
+   than emptying whichever job happens to be first. `max` puts the whole
+   outfit on it, `none` stands the job down. Returns the new assignments,
+   or null when nothing would move. */
+function assignCrew(s, jobId, n) {
+  const split = crewSplit(s);
+  const jobs = { ...split.jobs };
+  const have = jobs[jobId] || 0;
+  const want =
+    n === "max" ? split.n
+    : n === "none" ? 0
+    : Math.max(0, Math.min(have + n, split.n));
+  if (want < have) {
+    jobs[jobId] = want;
+    return jobs;
+  }
+  let need = want - have - Math.min(want - have, split.idle);
+  while (need > 0) {
+    let from = null;
+    for (const j of JOBS)
+      if (j.id !== jobId && jobs[j.id] > 0 && (!from || jobs[j.id] > jobs[from.id])) from = j;
+    if (!from) break;
+    jobs[from.id] -= 1;
+    need -= 1;
+  }
+  jobs[jobId] = want - need;
+  return jobs[jobId] === have ? null : jobs;
 }
 
 function derive(s, opts = {}) {
@@ -750,17 +819,23 @@ function derive(s, opts = {}) {
   });
   const auto = !!tech.triggers || !!opts.auto;
 
+  const dist = distById(s.district);
+
   /* What auto-fire adds on average, for the readouts. The survival test
      stays on raw stats: bursts are lumpy and a fight shorter than a
-     cooldown can't count on one. */
+     cooldown can't count on one.
+       A hit is worth at most one kill, however big it lands: the fight is
+     one foe at a time and a new one comes up at full health, so counting
+     a Training-Floor Haymaker's whole eight-thousand-fold overkill had
+     the XP readout — and the catch-up that settles off it — promising
+     twenty-five times the kills the fight could ever deliver. */
   let burst = 0;
   for (const a of abilities) {
-    if (a.kind === "hit") burst += a.amount / a.cd;
+    if (a.kind === "hit") burst += Math.min(a.amount, dist.hp) / a.cd;
     else if (a.kind === "boost") burst += power * (a.mag - 1) * a.dur / a.cd;
   }
   const sustain = auto ? power + burst : power;
 
-  const dist = distById(s.district);
   const ttk = power > 0 ? dist.hp / power : Infinity;
   const damageTaken = dist.dps * ttk;
   const winnable = damageTaken < resolve;
@@ -829,10 +904,21 @@ function projectMax(s, pr, discount) {
 const marketDip = (qty, cap) => 1 - TUNE.marketDip * (qty / (qty + Math.max(1, cap) * 0.25));
 const canPay = (cost, res) => Object.keys(cost).every((k) => res[k] >= cost[k]);
 
+/* The most of `item` you could buy in one go, capped at 1000 so a rich
+   player's tap stays a purchase rather than a landslide. Costs only ever
+   grow with the count, so this bisects instead of walking: the walk cost
+   a thousand geometric sums per item per frame, and the tab badges price
+   every building and every piece of gear on every one. */
 function maxAffordable(item, own, res, discount) {
-  let n = 0;
-  while (n < 1000 && canPay(costOf(item, own, n + 1, discount), res)) n++;
-  return n;
+  if (!canPay(costOf(item, own, 1, discount), res)) return 0;
+  let lo = 1, hi = 1000;
+  if (canPay(costOf(item, own, hi, discount), res)) return hi;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (canPay(costOf(item, own, mid, discount), res)) lo = mid;
+    else hi = mid;
+  }
+  return lo;
 }
 
 /* When auto-fire is on, would this ability be worth using right now?
@@ -880,7 +966,36 @@ function combatStep(s, dt, d) {
     heroHP = d.resolve;
   };
 
-  while (t > 1e-9 && guard++ < 5000) {
+  /* Settling a slice at the rate the readouts advertise. The remainder of
+     an exhausted loop comes through here, and so does a slice with more
+     kills in it than the loop could ever resolve — simulating five
+     thousand identical one-shot kills only to hand the rest to this same
+     formula burned a fortieth of a second a tick and changed nothing. */
+  const settle = (secs) => {
+    const n = Math.floor(secs / d.ttkEff);
+    if (n <= 0) return false;
+    kills += n;
+    xp += n * dist.xp * d.xpMult;
+    tick(secs);
+    enemyHP = foeHP();
+    heroHP = d.resolve;
+    return true;
+  };
+  /* Only ever between trash fights, on a fight the hero wins, with nobody
+     mid-knockout. Checked at each call site: the loop moves all three. */
+  const canSettle = () => !isBoss && ko <= 0 && d.winnable && d.ttkEff > 0 && Number.isFinite(d.ttkEff);
+  /* Two reasons to skip the loop: the fight is faster than it is worth
+     simulating one kill at a time, or the slice holds more kills than the
+     loop is budgeted for. The first is a rate, not a count, so live play,
+     the tests and a catch-up all cut over at the same strength instead of
+     at whatever slice length each happens to use.
+       A tapped ability is the player's, though. It has to fire, and the
+     settle would swallow it — no damage, no buff, no cooldown, a button
+     that looks broken — so a slice with one pending goes through the
+     loop and the next one settles. */
+  if (!cast && canSettle() && (1 / d.ttkEff >= TUNE.killBatch || t / d.ttkEff >= TUNE.fightSteps) && settle(t)) t = 0;
+
+  while (t > 1e-9 && guard++ < TUNE.fightSteps) {
     if (ko > 0) {
       const spend = Math.min(t, ko);
       ko -= spend; t -= spend; tick(spend);
@@ -931,19 +1046,9 @@ function combatStep(s, dt, d) {
   }
   /* A huge catch-up in a district that dies in milliseconds can exhaust
      the loop budget with time still on the clock. Settle the remainder
-     statistically at the same rate the readouts advertise — throwing the
-     hours away punished exactly the players farming fast kills. */
-  if (t > 1e-9 && !isBoss && d.winnable && d.ttkEff > 0 && Number.isFinite(d.ttkEff)) {
-    const n = Math.floor(t / d.ttkEff);
-    if (n > 0) {
-      kills += n;
-      xp += n * dist.xp * d.xpMult;
-      tick(t);
-      t = 0;
-      enemyHP = foeHP();
-      heroHP = d.resolve;
-    }
-  }
+     the same way — throwing the hours away punished exactly the players
+     farming fast kills. */
+  if (t > 1e-9 && canSettle() && settle(t)) t = 0;
   return { fight: { ...f, enemyHP, heroHP, ko, boss: isBoss, cd, buff, cast: [] }, xp, kills, bossWin, heroAtWin };
 }
 
@@ -1344,7 +1449,7 @@ export const engine = {
   JOBS, PROJECTS, MARKET, ACHIEVEMENTS, FLASHPOINTS, CONTRACTS, METRICS, KEEPSAKES,
   freshState, migrate, derive, step, costOf, powerCost, canPay, maxAffordable,
   unlocked, bossReady, forecastBoss, startBoss, bestDistrict, levelOf,
-  crewSplit, projectCost, projectMax, projectAt, marketDip,
+  crewSplit, assignCrew, projectCost, projectMax, projectAt, marketDip,
   rollContracts, contractTick, settleBoard, windfall, mergeBoon, catchUp, msCrossed, msNext,
 };
 
@@ -1675,7 +1780,8 @@ function useGame() {
     `People who work for you. Safehouses are beds and beds are the only reason anyone stays, so ${d.beds} is your ceiling; one more walks in every ${Math.round(TUNE.crewJoin / (1 + 0.15 * d.held))}s while there is room. ` +
     `Payroll runs at ${rate(d.upkeep)} funding a second and climbs steeply with the size of the outfit — miss it for ${TUNE.crewQuit}s and somebody hands their key back. ` +
     `New hands put themselves to work on the way in${s.tech.command ? ", on whichever job has the fewest" : ", following whoever is busiest"}. ` +
-    (d.crew.idle ? `${d.crew.idle} of them are standing around doing nothing.` : `All ${d.crew.n} are working.`);
+    (d.crew.idle ? `${d.crew.idle} of them are standing around doing nothing.` : `All ${d.crew.n} are working.`) +
+    ` You can move anyone at any time: + on a job pulls off the fullest one when nobody is idle.`;
 
   const jobTip = (j) => {
     const n = d.crew.jobs[j.id] || 0;
@@ -1683,7 +1789,8 @@ function useGame() {
       ? Object.keys(j.makes).map((k) => `${rate(j.makes[k] * d.crewMult * d.mult[k] * ((d.hero?.mods || {})[k] || 1) * d.global)} ${nameOf(k).toLowerCase()}/s`).join(" and ")
       : j.combat ? `+${pct(j.combat * d.crewMult)} power and resolve`
       : `+${pct(j.xp * d.crewMult)} XP a kill`;
-    return `${j.blurb} Each hand on this is worth ${what}. ${n} assigned${s.tech.command ? ", and Chain of Command has them working half again as hard" : ""}.`;
+    return `${j.blurb} Each hand on this is worth ${what}. ${n} assigned${s.tech.command ? ", and Chain of Command has them working half again as hard" : ""}. ` +
+      `+ takes an idle hand if there is one and pulls off the fullest other job if there isn't; all puts the whole outfit of ${d.crew.n} on it; − stands one down.`;
   };
 
   const marketTip = (id) =>
@@ -1846,11 +1953,8 @@ function useGame() {
   /* ---- crew ---- */
   const assign = (jobId, n) =>
     setS((p) => {
-      const split = crewSplit(p);
-      const have = split.jobs[jobId] || 0;
-      const want = n === "max" ? have + split.idle : n === "none" ? 0 : Math.max(0, Math.min(have + n, have + split.idle));
-      if (want === have) return p;
-      return { ...p, crew: { ...p.crew, jobs: { ...split.jobs, [jobId]: want } } };
+      const jobs = assignCrew(p, jobId, n);
+      return jobs ? { ...p, crew: { ...p.crew, jobs } } : p;
     });
   const spreadCrew = () =>
     setS((p) => {
@@ -2389,7 +2493,13 @@ function Crew({ g }) {
       )}
       <div className="n-sec">
         <span className="n-sec-l">Assignments</span>
-        <span className="n-sec-s">{d.crew.idle} idle · idle hands still cost payroll</span>
+        <span className="n-sec-s">
+          {d.crew.idle
+            ? `${d.crew.idle} idle · idle hands still cost payroll`
+            : d.crew.n
+            ? "nobody idle · + pulls a hand off the fullest job"
+            : "nobody on the books yet"}
+        </span>
         <span className="n-modes">
           <button className="n-mode" onClick={g.spreadCrew}>split evenly</button>
           <button className="n-mode" onClick={g.clearCrew}>stand down</button>
@@ -2414,9 +2524,9 @@ function Crew({ g }) {
               <div className="n-item-bot">
                 <span className="n-sub">{what} each</span>
                 <span className="n-crew-btns">
-                  <button className="n-mode" disabled={!n} onClick={() => g.assign(j.id, -1)}>−</button>
-                  <button className="n-mode" disabled={!d.crew.idle} onClick={() => g.assign(j.id, 1)}>+</button>
-                  <button className="n-mode" disabled={!d.crew.idle} onClick={() => g.assign(j.id, "max")}>all</button>
+                  <button className="n-mode" title={`Take one off ${j.name}`} disabled={!n} onClick={() => g.assign(j.id, -1)}>−</button>
+                  <button className="n-mode" title={`One more on ${j.name} — an idle hand, or one off the fullest job`} disabled={n >= d.crew.n} onClick={() => g.assign(j.id, 1)}>+</button>
+                  <button className="n-mode" title={`The whole outfit on ${j.name}`} disabled={n >= d.crew.n} onClick={() => g.assign(j.id, "max")}>all</button>
                 </span>
               </div>
             </div>

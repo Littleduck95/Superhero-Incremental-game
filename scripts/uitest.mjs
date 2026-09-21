@@ -1,14 +1,15 @@
 /* Drives the BUILT game in a real Chromium and checks what the engine
    tests can't: that the systems actually render and respond. Covers the
    flashpoint banner, patrol momentum, the bounty board and streak, a
-   stakeout round, the ticker, ownership marks, and the estate rite.
+   stakeout round, the ticker, ownership marks, the crew board, the
+   1-4 ability keys, and the estate rite.
      npm run test:ui
    The dependency is `playwright-core`, which drives a browser but ships
    none, so point CHROMIUM_PATH at a Chromium or Chrome binary if one
    isn't in the usual places. Starts its own `vite preview` on a spare
    port and always stops it again, even when a check throws — a leaked
    server would make every later run fail on the port.
-   Exits non-zero on the first thing that is wrong. */
+   Runs every check and exits non-zero if any of them failed. */
 import { chromium } from "playwright-core";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -77,6 +78,7 @@ const up = async () => {
 if (!(await up())) { console.log("FAIL preview server never came up — run `npm run build` first"); stopServer(); process.exit(1); }
 
 let browser;
+let crewCtx, keysCtx, riteCtx, bootCtx;
 try {
   browser = await chromium.launch({ executablePath: findChromium() });
 } catch (e) {
@@ -143,9 +145,80 @@ await page.getByRole("tab", { name: /Region/ }).click();
 await page.waitForTimeout(300);
 ok("a producer shows its next mark", /×2 at 25/.test(await page.locator(".n-item", { hasText: "ROOFTOP PERCH" }).innerText()));
 
+/* ---- the crew board: a hand can be moved with nobody idle ---- */
+/* Crew put themselves to work the moment they walk in, so a board that
+   could only spend idle hands was one no player could ever use. */
+const crewSeed = { at: Date.now(), state: { ...seeded.state, own: { ...seeded.state.own, safehouse: 2 }, res: { ...seeded.state.res, funding: 200000 },
+  crew: { n: 8, grow: 0, unpaid: 0, jobs: { beat: 8, scavenge: 0, outreach: 0, sparring: 0, intel: 0 } }, flash: null } };
+crewCtx = await browser.newContext();
+const pageCrew = await crewCtx.newPage();
+pageCrew.on("pageerror", (e) => fail("crew page error: " + e.message));
+await pageCrew.addInitScript((s) => localStorage.setItem("mantle:hero:v3", JSON.stringify(s)), crewSeed);
+await pageCrew.goto(URL);
+await pageCrew.waitForTimeout(1200);
+await pageCrew.getByRole("tab", { name: /Crew/ }).click();
+await pageCrew.waitForTimeout(300);
+const heads = async () => {
+  const out = {};
+  for (const row of await pageCrew.locator(".n-job").all())
+    out[(await row.locator(".n-name").innerText()).trim()] = Number(await row.locator(".n-count").innerText());
+  return out;
+};
+const crewStart = await heads();
+ok("the outfit starts on one job with nobody idle", crewStart["STREET BEAT"] === 8 && /nobody idle/.test(await pageCrew.locator(".n-sec-s").nth(1).innerText()));
+const sparPlus = pageCrew.locator(".n-job", { hasText: "SPARRING" }).locator(".n-crew-btns button", { hasText: "+" });
+ok("+ is offered with nobody idle", !(await sparPlus.isDisabled()));
+await sparPlus.click();
+await pageCrew.waitForTimeout(250);
+const crewMoved = await heads();
+ok("+ moves a hand off the fullest job", crewMoved["SPARRING"] === 1 && crewMoved["STREET BEAT"] === 7, JSON.stringify(crewMoved));
+ok("+ moves, it does not hire", Object.values(crewMoved).reduce((a, b) => a + b, 0) === 8, JSON.stringify(crewMoved));
+await pageCrew.locator(".n-job", { hasText: "INTEL DESK" }).locator(".n-crew-btns button", { hasText: "all" }).click();
+await pageCrew.waitForTimeout(250);
+const crewAll = await heads();
+ok("all puts the whole outfit on one job", crewAll["INTEL DESK"] === 8, JSON.stringify(crewAll));
+await pageCrew.getByRole("button", { name: "stand down" }).click();
+await pageCrew.waitForTimeout(250);
+ok("stand down frees everyone", /8 idle/.test(await pageCrew.locator(".n-sec-s").nth(1).innerText()));
+
+/* ---- the keyboard: 1-4 fire abilities, and only on the fight tab ---- */
+keysCtx = await browser.newContext();
+const pageKeys = await keysCtx.newPage();
+pageKeys.on("pageerror", (e) => fail("keys page error: " + e.message));
+const keysSeed = { at: Date.now(), state: { ...seeded.state, flash: null,
+  tech: { haymaker: true, brace: true }, own: { ...seeded.state.own, gym: 1 } } };
+await pageKeys.addInitScript((s) => localStorage.setItem("mantle:hero:v3", JSON.stringify(s)), keysSeed);
+await pageKeys.goto(URL);
+await pageKeys.waitForTimeout(1200);
+const abilText = () => pageKeys.locator(".n-abil").first().innerText();
+const abilBefore = await abilText();
+await pageKeys.keyboard.press("1");
+await pageKeys.waitForTimeout(400);
+ok("pressing 1 fires the first ability", abilBefore !== (await abilText()), abilBefore.replace(/\n/g, " "));
+const secondRested = await pageKeys.locator(".n-abil").nth(1).innerText();
+await pageKeys.keyboard.press("Control+2");
+await pageKeys.waitForTimeout(300);
+ok("a modifier is the browser's, not the game's", secondRested === (await pageKeys.locator(".n-abil").nth(1).innerText()));
+await pageKeys.getByRole("tab", { name: /Region/ }).click();
+await pageKeys.waitForTimeout(250);
+await pageKeys.keyboard.press("2");
+await pageKeys.waitForTimeout(250);
+await pageKeys.getByRole("tab", { name: /Fight/ }).click();
+await pageKeys.waitForTimeout(250);
+ok("ability keys do nothing from another tab", secondRested === (await pageKeys.locator(".n-abil").nth(1).innerText()),
+  await pageKeys.locator(".n-abil").nth(1).innerText());
+/* a tip opens on tap and Escape closes it */
+await pageKeys.locator(".n-info").first().click();
+await pageKeys.waitForTimeout(250);
+const tipOpen = await pageKeys.locator('[role="tooltip"]').count();
+await pageKeys.keyboard.press("Escape");
+await pageKeys.waitForTimeout(250);
+ok("a tooltip opens on tap and Escape closes it", tipOpen === 1 && (await pageKeys.locator('[role="tooltip"]').count()) === 0, "open " + tipOpen);
+
 /* ---- the estate rite: confirm the pass, take a keepsake ---- */
 const rich = { at: Date.now(), state: { ...seeded.state, hero: "bastion", tech: { mantle: true }, careerFunding: 9e9, flash: null } };
-const page3 = await (await browser.newContext()).newPage();
+riteCtx = await browser.newContext();
+const page3 = await riteCtx.newPage();
 page3.on("pageerror", (e) => fail("rite page error: " + e.message));
 await page3.addInitScript((s) => localStorage.setItem("mantle:hero:v3", JSON.stringify(s)), rich);
 await page3.goto(URL);
@@ -182,7 +255,8 @@ ok("the keepsake survived the reset", (await page3.locator(".n-badge-card", { ha
 ok("the career stats show", (await page3.locator(".n-career-card").count()) >= 5);
 
 /* fresh boot still reaches hero select */
-const page2 = await (await browser.newContext()).newPage();
+bootCtx = await browser.newContext();
+const page2 = await bootCtx.newPage();
 await page2.goto(URL);
 await page2.waitForTimeout(800);
 ok("fresh boot shows hero select", (await page2.locator(".n-hero").count()) === 4);
@@ -190,6 +264,10 @@ ok("fresh boot shows hero select", (await page2.locator(".n-hero").count()) === 
 } catch (e) {
   fail("threw: " + (e && e.message ? e.message : e));
 } finally {
+  /* each context is a whole browser profile: close them rather than
+     leaving them open until the browser goes down at the end */
+  for (const ctx of [crewCtx, keysCtx, riteCtx, bootCtx])
+    if (ctx) { try { await ctx.close(); } catch { /* already down */ } }
   try { await browser.close(); } catch { /* already down */ }
   stopServer();
 }

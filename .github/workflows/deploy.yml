@@ -25,6 +25,9 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      # The engine checks are fast and need no browser: a broken engine
+      # should never reach the published page.
+      - run: npm test
       - run: npm run build
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
