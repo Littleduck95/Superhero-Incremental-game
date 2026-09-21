@@ -112,8 +112,9 @@ Builds the site and drives it in a real Chromium (`scripts/uitest.mjs`):
 the flashpoint banner pays and clears, patrol momentum shows, the board
 and streak render, a stakeout round resolves to a cooldown, a producer
 prints its next mark, a hand moves between crew jobs with nobody idle,
-and the estate rite hands a keepsake to a brand-new career that survives
-the reset. It seeds saves through `localStorage`
+the 1-4 keys fire abilities from the fight tab and nowhere else, and the
+estate rite hands a keepsake to a brand-new career that survives the
+reset. It seeds saves through `localStorage`
 before boot, starts and stops its own preview server, and fails on any
 uncaught page error. Set `CHROMIUM_PATH` if Playwright can't find a
 browser of its own.

@@ -1,8 +1,8 @@
 /* Drives the BUILT game in a real Chromium and checks what the engine
    tests can't: that the systems actually render and respond. Covers the
    flashpoint banner, patrol momentum, the bounty board and streak, a
-   stakeout round, the ticker, ownership marks, the crew board, and the
-   estate rite.
+   stakeout round, the ticker, ownership marks, the crew board, the
+   1-4 ability keys, and the estate rite.
      npm run test:ui
    The dependency is `playwright-core`, which drives a browser but ships
    none, so point CHROMIUM_PATH at a Chromium or Chrome binary if one
@@ -78,7 +78,7 @@ const up = async () => {
 if (!(await up())) { console.log("FAIL preview server never came up — run `npm run build` first"); stopServer(); process.exit(1); }
 
 let browser;
-let crewCtx, riteCtx, bootCtx;
+let crewCtx, keysCtx, riteCtx, bootCtx;
 try {
   browser = await chromium.launch({ executablePath: findChromium() });
 } catch (e) {
@@ -181,6 +181,40 @@ await pageCrew.getByRole("button", { name: "stand down" }).click();
 await pageCrew.waitForTimeout(250);
 ok("stand down frees everyone", /8 idle/.test(await pageCrew.locator(".n-sec-s").nth(1).innerText()));
 
+/* ---- the keyboard: 1-4 fire abilities, and only on the fight tab ---- */
+keysCtx = await browser.newContext();
+const pageKeys = await keysCtx.newPage();
+pageKeys.on("pageerror", (e) => fail("keys page error: " + e.message));
+const keysSeed = { at: Date.now(), state: { ...seeded.state, flash: null,
+  tech: { haymaker: true, brace: true }, own: { ...seeded.state.own, gym: 1 } } };
+await pageKeys.addInitScript((s) => localStorage.setItem("mantle:hero:v3", JSON.stringify(s)), keysSeed);
+await pageKeys.goto(URL);
+await pageKeys.waitForTimeout(1200);
+const abilText = () => pageKeys.locator(".n-abil").first().innerText();
+const abilBefore = await abilText();
+await pageKeys.keyboard.press("1");
+await pageKeys.waitForTimeout(400);
+ok("pressing 1 fires the first ability", abilBefore !== (await abilText()), abilBefore.replace(/\n/g, " "));
+const secondRested = await pageKeys.locator(".n-abil").nth(1).innerText();
+await pageKeys.keyboard.press("Control+2");
+await pageKeys.waitForTimeout(300);
+ok("a modifier is the browser's, not the game's", secondRested === (await pageKeys.locator(".n-abil").nth(1).innerText()));
+await pageKeys.getByRole("tab", { name: /Region/ }).click();
+await pageKeys.waitForTimeout(250);
+await pageKeys.keyboard.press("2");
+await pageKeys.waitForTimeout(250);
+await pageKeys.getByRole("tab", { name: /Fight/ }).click();
+await pageKeys.waitForTimeout(250);
+ok("ability keys do nothing from another tab", secondRested === (await pageKeys.locator(".n-abil").nth(1).innerText()),
+  await pageKeys.locator(".n-abil").nth(1).innerText());
+/* a tip opens on tap and Escape closes it */
+await pageKeys.locator(".n-info").first().click();
+await pageKeys.waitForTimeout(250);
+const tipOpen = await pageKeys.locator('[role="tooltip"]').count();
+await pageKeys.keyboard.press("Escape");
+await pageKeys.waitForTimeout(250);
+ok("a tooltip opens on tap and Escape closes it", tipOpen === 1 && (await pageKeys.locator('[role="tooltip"]').count()) === 0, "open " + tipOpen);
+
 /* ---- the estate rite: confirm the pass, take a keepsake ---- */
 const rich = { at: Date.now(), state: { ...seeded.state, hero: "bastion", tech: { mantle: true }, careerFunding: 9e9, flash: null } };
 riteCtx = await browser.newContext();
@@ -232,7 +266,7 @@ ok("fresh boot shows hero select", (await page2.locator(".n-hero").count()) === 
 } finally {
   /* each context is a whole browser profile: close them rather than
      leaving them open until the browser goes down at the end */
-  for (const ctx of [crewCtx, riteCtx, bootCtx])
+  for (const ctx of [crewCtx, keysCtx, riteCtx, bootCtx])
     if (ctx) { try { await ctx.close(); } catch { /* already down */ } }
   try { await browser.close(); } catch { /* already down */ }
   stopServer();
