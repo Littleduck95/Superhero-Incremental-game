@@ -156,6 +156,27 @@ ok("garbage queue becomes a list", Array.isArray(junk.queue));
 ok("garbage crew is countable", Number.isFinite(junk.crew.n) && Number.isFinite(junk.crew.jobs.beat));
 const junkStep = E.step(junk, 60, { quiet: true });
 ok("a scrubbed save steps cleanly", Number.isFinite(junkStep.res.funding) && Number.isFinite(junkStep.totalXP));
+/* a project is a count and a slice, and both feed multipliers on
+   everything: junk in either used to turn the whole game into NaN */
+const junkWorks = E.migrate({ hero: "grayline", tech: { projects: true },
+  projects: { beacon: { done: "x", prog: "y" }, ward: { done: -4, prog: 9 }, spire: 7, nonesuch: { done: 3 } } });
+const dw = E.derive(junkWorks);
+ok("a junk project can't NaN the game", [dw.global, dw.power, dw.resolve, dw.caps.leads, dw.gross.funding].every(Number.isFinite),
+  JSON.stringify({ g: dw.global, p: dw.power, cap: dw.caps.leads }));
+ok("a junk project slice is clamped inside the next one", E.projectAt(junkWorks, E.PROJECTS.find((p) => p.id === "ward")).prog < 1);
+ok("an unknown project is dropped", !("nonesuch" in junkWorks.projects) && !("spire" in junkWorks.projects), JSON.stringify(junkWorks.projects));
+/* nothing you hold runs backwards */
+const junkNeg = E.migrate({ hero: "grayline", res: { leads: -500, funding: -1e9 }, own: { perch: -20, lockup: 2.7 }, gear: { rig: -8 }, ranks: { impact: -3 } });
+ok("negative holdings are scrubbed", junkNeg.res.leads === 0 && junkNeg.own.perch === 0 && junkNeg.gear.rig === 0 && junkNeg.ranks.impact === 0);
+ok("fractional holdings are whole", junkNeg.own.lockup === 2);
+/* the bisecting max-buy has to land where walking the costs landed */
+for (const item of [...E.TERRITORY, ...E.GEAR]) {
+  const res = { leads: 4e6, salvage: 4e6, funding: 4e6, xp: 4e6 };
+  let walked = 0;
+  while (walked < 1000 && E.canPay(E.costOf(item, 7, walked + 1, 1), res)) walked++;
+  ok("max buy bisects to the same count: " + item.id, E.maxAffordable(item, 7, res, 1) === walked,
+    `${E.maxAffordable(item, 7, res, 1)} vs ${walked}`);
+}
 
 /* 14. ownership marks double producers, and only producers */
 let ms = { ...E.migrate(null), hero: "grayline" };

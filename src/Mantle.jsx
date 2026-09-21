@@ -524,14 +524,30 @@ function migrate(saved) {
      NaN factory. The loader parks a save that still won't load under a
      rescue key rather than letting the autosave pave over it. */
   const num = (v, d0 = 0) => (Number.isFinite(v) ? v : d0);
+  /* nothing you hold is negative or fractional, and a save that says
+     otherwise would run the region backwards rather than fail loudly */
+  const count = (v) => Math.max(0, Math.floor(num(v)));
   for (const k of ["ranks", "tech", "cleared", "bosses", "projects", "autosell", "achieved", "keepsakes"])
     if (!back[k] || typeof back[k] !== "object" || Array.isArray(back[k])) back[k] = {};
   if (!Array.isArray(back.queue)) back.queue = [];
-  for (const k of RES_IDS) back.res[k] = num(back.res[k]);
-  for (const t of TERRITORY) back.own[t.id] = num(back.own[t.id]);
-  for (const gi of GEAR) back.gear[gi.id] = num(back.gear[gi.id]);
-  for (const k in back.ranks) back.ranks[k] = num(back.ranks[k]);
-  for (const k in back.cleared) back.cleared[k] = num(back.cleared[k]);
+  for (const k of RES_IDS) back.res[k] = Math.max(0, num(back.res[k]));
+  for (const t of TERRITORY) back.own[t.id] = count(back.own[t.id]);
+  for (const gi of GEAR) back.gear[gi.id] = count(back.gear[gi.id]);
+  for (const k in back.ranks) back.ranks[k] = count(back.ranks[k]);
+  for (const k in back.cleared) back.cleared[k] = count(back.cleared[k]);
+  /* A project is a count of completions and a slice of the next one, and
+     both feed multipliers on everything. A junk one turned the whole
+     game — power, resolve, income, storage — into NaN on load, which is
+     exactly what the scrub above exists to prevent. */
+  const works = {};
+  for (const pr of PROJECTS) {
+    const at = back.projects[pr.id];
+    if (!at || typeof at !== "object") continue;
+    const done = count(at.done);
+    const prog = Math.min(1 - 1e-5, Math.max(0, num(at.prog)));
+    if (done || prog) works[pr.id] = { done, prog };
+  }
+  back.projects = works;
   /* keepsake counts multiply combat and income, so a junk or negative
      one would poison every stat rather than merely miscount */
   for (const k in back.keepsakes) back.keepsakes[k] = Math.max(0, Math.floor(num(back.keepsakes[k])));
@@ -869,10 +885,21 @@ function projectMax(s, pr, discount) {
 const marketDip = (qty, cap) => 1 - TUNE.marketDip * (qty / (qty + Math.max(1, cap) * 0.25));
 const canPay = (cost, res) => Object.keys(cost).every((k) => res[k] >= cost[k]);
 
+/* The most of `item` you could buy in one go, capped at 1000 so a rich
+   player's tap stays a purchase rather than a landslide. Costs only ever
+   grow with the count, so this bisects instead of walking: the walk cost
+   a thousand geometric sums per item per frame, and the tab badges price
+   every building and every piece of gear on every one. */
 function maxAffordable(item, own, res, discount) {
-  let n = 0;
-  while (n < 1000 && canPay(costOf(item, own, n + 1, discount), res)) n++;
-  return n;
+  if (!canPay(costOf(item, own, 1, discount), res)) return 0;
+  let lo = 1, hi = 1000;
+  if (canPay(costOf(item, own, hi, discount), res)) return hi;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (canPay(costOf(item, own, mid, discount), res)) lo = mid;
+    else hi = mid;
+  }
+  return lo;
 }
 
 /* When auto-fire is on, would this ability be worth using right now?
