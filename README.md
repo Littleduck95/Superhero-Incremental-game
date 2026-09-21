@@ -102,7 +102,7 @@ keeps the kills it is owed, that offline catch-up can't farm random events
 or flashpoints, that the bounty board rolls, pays, streaks and lapses on
 the right days, that ownership marks land on producers only, that
 keepsakes apply and stack, and that every tech requirement points at a
-node that exists. It exits non-zero on the first thing that is wrong.
+node that exists. It runs every check and exits non-zero if any failed.
 
 ```
 npm run test:ui

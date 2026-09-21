@@ -9,7 +9,7 @@
    isn't in the usual places. Starts its own `vite preview` on a spare
    port and always stops it again, even when a check throws — a leaked
    server would make every later run fail on the port.
-   Exits non-zero on the first thing that is wrong. */
+   Runs every check and exits non-zero if any of them failed. */
 import { chromium } from "playwright-core";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -78,6 +78,7 @@ const up = async () => {
 if (!(await up())) { console.log("FAIL preview server never came up — run `npm run build` first"); stopServer(); process.exit(1); }
 
 let browser;
+let crewCtx, riteCtx, bootCtx;
 try {
   browser = await chromium.launch({ executablePath: findChromium() });
 } catch (e) {
@@ -149,7 +150,8 @@ ok("a producer shows its next mark", /×2 at 25/.test(await page.locator(".n-ite
    could only spend idle hands was one no player could ever use. */
 const crewSeed = { at: Date.now(), state: { ...seeded.state, own: { ...seeded.state.own, safehouse: 2 }, res: { ...seeded.state.res, funding: 200000 },
   crew: { n: 8, grow: 0, unpaid: 0, jobs: { beat: 8, scavenge: 0, outreach: 0, sparring: 0, intel: 0 } }, flash: null } };
-const pageCrew = await (await browser.newContext()).newPage();
+crewCtx = await browser.newContext();
+const pageCrew = await crewCtx.newPage();
 pageCrew.on("pageerror", (e) => fail("crew page error: " + e.message));
 await pageCrew.addInitScript((s) => localStorage.setItem("mantle:hero:v3", JSON.stringify(s)), crewSeed);
 await pageCrew.goto(URL);
@@ -181,7 +183,8 @@ ok("stand down frees everyone", /8 idle/.test(await pageCrew.locator(".n-sec-s")
 
 /* ---- the estate rite: confirm the pass, take a keepsake ---- */
 const rich = { at: Date.now(), state: { ...seeded.state, hero: "bastion", tech: { mantle: true }, careerFunding: 9e9, flash: null } };
-const page3 = await (await browser.newContext()).newPage();
+riteCtx = await browser.newContext();
+const page3 = await riteCtx.newPage();
 page3.on("pageerror", (e) => fail("rite page error: " + e.message));
 await page3.addInitScript((s) => localStorage.setItem("mantle:hero:v3", JSON.stringify(s)), rich);
 await page3.goto(URL);
@@ -218,7 +221,8 @@ ok("the keepsake survived the reset", (await page3.locator(".n-badge-card", { ha
 ok("the career stats show", (await page3.locator(".n-career-card").count()) >= 5);
 
 /* fresh boot still reaches hero select */
-const page2 = await (await browser.newContext()).newPage();
+bootCtx = await browser.newContext();
+const page2 = await bootCtx.newPage();
 await page2.goto(URL);
 await page2.waitForTimeout(800);
 ok("fresh boot shows hero select", (await page2.locator(".n-hero").count()) === 4);
@@ -226,6 +230,10 @@ ok("fresh boot shows hero select", (await page2.locator(".n-hero").count()) === 
 } catch (e) {
   fail("threw: " + (e && e.message ? e.message : e));
 } finally {
+  /* each context is a whole browser profile: close them rather than
+     leaving them open until the browser goes down at the end */
+  for (const ctx of [crewCtx, riteCtx, bootCtx])
+    if (ctx) { try { await ctx.close(); } catch { /* already down */ } }
   try { await browser.close(); } catch { /* already down */ }
   stopServer();
 }

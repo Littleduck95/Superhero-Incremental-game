@@ -1,7 +1,7 @@
 /* Sanity checks for the engine: old saves, the storage ceiling, crew
    payroll, offline catch-up, project slices and the content tables.
      node scripts/sanity.mjs
-   Exits non-zero on the first thing that is wrong. This is not a balance
+   Runs every check and exits non-zero if any of them failed. This is not a balance
    check — balance.mjs is — it only asserts that nothing is broken. */
 import { E } from "./engine.mjs";
 
@@ -165,6 +165,36 @@ ok("a junk project can't NaN the game", [dw.global, dw.power, dw.resolve, dw.cap
   JSON.stringify({ g: dw.global, p: dw.power, cap: dw.caps.leads }));
 ok("a junk project slice is clamped inside the next one", E.projectAt(junkWorks, E.PROJECTS.find((p) => p.id === "ward")).prog < 1);
 ok("an unknown project is dropped", !("nonesuch" in junkWorks.projects) && !("spire" in junkWorks.projects), JSON.stringify(junkWorks.projects));
+/* the career counters multiply the region and set the ceilings: a save
+   claiming negative legacy ran every one of them backwards */
+const junkCareer = E.migrate({ hero: "grayline", legacy: -1000, totalXP: -5e6, careerFunding: -1e9,
+  traded: -7, patrols: -3, runs: -2, time: -50, streak: { days: -50, last: -9 } });
+const dc = E.derive(junkCareer);
+ok("a negative career can't run the region backwards", dc.global > 0 && dc.caps.leads > 0 && dc.patrol > 0,
+  `global ${dc.global} caps ${dc.caps.leads} patrol ${dc.patrol}`);
+ok("and the counters themselves are scrubbed",
+  junkCareer.legacy === 0 && junkCareer.totalXP === 0 && junkCareer.careerFunding === 0 && junkCareer.streak.days === 0);
+/* crewSplit clamps on read, but the tick works the raw map */
+const junkJobs = E.migrate({ hero: "grayline", crew: { n: 5, jobs: { beat: -4, scavenge: 2.7 } } });
+ok("junk crew assignments are scrubbed at load",
+  junkJobs.crew.jobs.beat === 0 && junkJobs.crew.jobs.scavenge === 2, JSON.stringify(junkJobs.crew.jobs));
+/* an invalid slice is not progress: clamping it up handed over a project */
+const junkProg = E.migrate({ hero: "grayline", projects: { ward: { done: -4, prog: 9 } } });
+ok("an impossible project slice is not free progress", E.projectAt(junkProg, E.PROJECTS.find((p) => p.id === "ward")).prog === 0,
+  JSON.stringify(junkProg.projects));
+const keptProg = E.migrate({ hero: "grayline", projects: { ward: { done: 2, prog: 0.4 } } });
+ok("a real project slice is kept", keptProg.projects.ward.done === 2 && Math.abs(keptProg.projects.ward.prog - 0.4) < 1e-9);
+
+/* migrate scrubs in place, so the state it returns must be its own */
+const shared = { hero: "grayline", ranks: { impact: 3.7 }, cleared: { flats: 9.2 }, keepsakes: { bag: 2.5 }, queue: [], log: [] };
+const migrated = E.migrate(shared);
+ok("migrate never writes back through the save it was handed",
+  shared.ranks.impact === 3.7 && shared.cleared.flats === 9.2 && shared.keepsakes.bag === 2.5,
+  JSON.stringify({ r: shared.ranks, c: shared.cleared, k: shared.keepsakes }));
+ok("and shares no mutable part of it",
+  migrated.ranks !== shared.ranks && migrated.cleared !== shared.cleared
+  && migrated.keepsakes !== shared.keepsakes && migrated.queue !== shared.queue && migrated.log !== shared.log);
+
 /* nothing you hold runs backwards */
 const junkNeg = E.migrate({ hero: "grayline", res: { leads: -500, funding: -1e9 }, own: { perch: -20, lockup: 2.7 }, gear: { rig: -8 }, ranks: { impact: -3 } });
 ok("negative holdings are scrubbed", junkNeg.res.leads === 0 && junkNeg.own.perch === 0 && junkNeg.gear.rig === 0 && junkNeg.ranks.impact === 0);
@@ -270,13 +300,48 @@ const ranAt = (f, slices) => {
   for (let i = 0; i < slices; i++) b = E.step(b, 1, { quiet: true });
   return Object.values(b.cleared).reduce((a, c) => a + c, 0);
 };
+/* The readout check has to simulate every kill, or it compares ttkEff
+   against kills the settle awarded off ttkEff and can never fail. */
+const realBatch0 = E.TUNE.killBatch, realSteps0 = E.TUNE.fightSteps;
 for (const [label, f] of [["mid", fighter(25, 15, 10, 4, "docks")], ["endgame", fighter(120, 80, 40, 120, "docks")]]) {
   const dd = E.derive(f);
   const promised = 1 / dd.ttkEff;
+  E.TUNE.killBatch = Infinity;
+  E.TUNE.fightSteps = 1e9;
   const real = ranAt(f, 20) / 20;
+  E.TUNE.killBatch = realBatch0;
+  E.TUNE.fightSteps = realSteps0;
   ok(`the XP readout matches the fight (${label})`, real > promised * 0.6 && real < promised * 1.5,
     `promised ${promised.toFixed(1)}/s, ran at ${real.toFixed(1)}/s`);
 }
+/* A tap is the player's move and the shortcut must not swallow it: the
+   settle skipped the ability loop outright, so in a fast enough fight a
+   tapped ability did nothing at all — no damage, no buff, no cooldown. */
+const tapper = fighter(120, 80, 40, 120, "flats");
+const tappedIn = { ...tapper, fight: { ...tapper.fight, cast: ["surge"] } };
+const realBatch1 = E.TUNE.killBatch, realSteps1 = E.TUNE.fightSteps;
+const tappedOut = E.step(tappedIn, 1, { quiet: true });
+E.TUNE.killBatch = Infinity;
+E.TUNE.fightSteps = 1e9;
+const tappedFull = E.step(tappedIn, 1, { quiet: true });
+E.TUNE.killBatch = realBatch1;
+E.TUNE.fightSteps = realSteps1;
+ok("a tapped ability fires even in a settled slice", (tappedOut.fight.cd.surge || 0) > 0,
+  `cd ${JSON.stringify(tappedOut.fight.cd)} buff ${JSON.stringify(tappedOut.fight.buff)}`);
+ok("and fires exactly as it would if every kill were simulated",
+  Math.abs((tappedOut.fight.cd.surge || 0) - (tappedFull.fight.cd.surge || 0)) < 1e-6,
+  `${tappedOut.fight.cd.surge} vs ${tappedFull.fight.cd.surge}`);
+
+/* the cut-over is a rate, so it must not move with the slice length */
+const rated = fighter(120, 80, 40, 120, "docks");
+const perSlice = [0.1, 1, 60].map((dt) => {
+  let b = rated;
+  for (let i = 0; i < 60 / dt; i++) b = E.step(b, dt, { quiet: true });
+  return Object.values(b.cleared).reduce((a, c) => a + c, 0);
+});
+ok("60 seconds pays the same however it is sliced",
+  perSlice.every((v) => Math.abs(v - perSlice[0]) <= perSlice[0] * 0.05), perSlice.join(" / "));
+
 /* the batch is a shortcut, not a payout: it must land where the full
    simulation lands */
 const batched = fighter(120, 80, 40, 120, "flats");

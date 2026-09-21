@@ -1,0 +1,21 @@
+name: Tests
+
+# The deploy workflow runs these too, but only on a push to main — by then
+# a broken engine is already merged. This is the check that gates the PR.
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+jobs:
+  engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test

@@ -385,7 +385,8 @@ const TUNE = {
   safehouseEach: 0.05,   /* cooldowns divided by 1 + this per safehouse */
   gymEach: 0.08,         /* ability magnitude and duration, per floor */
   bossSimSeconds: 600,
-  killBatch: 200,        /* kills in one slice past which the fight is settled, not simulated */
+  killBatch: 200,        /* kills a second past which a fight is settled, not simulated */
+  fightSteps: 5000,      /* event boundaries one combat slice may resolve before it is settled */
   capBase: { leads: 900, salvage: 900, funding: 500 },
   capEach: { leads: 2600, salvage: 2600, funding: 1300 },
   capHeld: 0.25,          /* storage per district held */
@@ -503,7 +504,15 @@ function migrate(saved) {
     autosell: { ...st.autosell },
     projects: { ...st.projects },
     achieved: { ...st.achieved },
-    log: Array.isArray(st.log) ? st.log : [],
+    /* every branch below scrubs these in place, so they have to be this
+       state's own: taken straight off `st` the scrub wrote back through
+       the save it was handed, and the two states shared the objects
+       afterwards. Everything else here is copied for the same reason. */
+    ranks: { ...st.ranks },
+    cleared: { ...st.cleared },
+    keepsakes: { ...st.keepsakes },
+    queue: Array.isArray(st.queue) ? [...st.queue] : [],
+    log: Array.isArray(st.log) ? [...st.log] : [],
     tech: { ...st.tech },
     bosses: { ...st.bosses },
   };
@@ -544,7 +553,11 @@ function migrate(saved) {
     const at = back.projects[pr.id];
     if (!at || typeof at !== "object") continue;
     const done = count(at.done);
-    const prog = Math.min(1 - 1e-5, Math.max(0, num(at.prog)));
+    /* a slice is a share of the next completion: anything outside [0, 1)
+       was never a real slice, and clamping it upwards would hand over a
+       virtually finished project for a rounding error */
+    const raw = num(at.prog);
+    const prog = raw > 0 && raw < 1 ? raw : 0;
     if (done || prog) works[pr.id] = { done, prog };
   }
   back.projects = works;
@@ -555,13 +568,19 @@ function migrate(saved) {
     ? { picks: back.estate.picks.filter((id) => KEEPSAKES.some((k) => k.id === id)) }
     : null;
   for (const m of MARKET) back.market[m.id] = num(back.market[m.id], 1);
-  for (const k of ["time", "totalXP", "legacy", "careerFunding", "allTimeFunding", "traded", "patrols", "stakeoutAt", "runs"])
-    back[k] = num(back[k]);
-  back.crew.n = Math.max(0, Math.floor(num(back.crew.n)));
-  back.crew.grow = num(back.crew.grow);
-  back.crew.unpaid = num(back.crew.unpaid);
-  for (const j of JOBS) back.crew.jobs[j.id] = num(back.crew.jobs[j.id]);
-  back.streak = { days: num(back.streak.days), last: num(back.streak.last) };
+  /* The career counters only ever go up, and half of them multiply the
+     whole region: a save claiming -1000 legacy loaded as written ran
+     every multiplier and every storage ceiling negative. */
+  for (const k of ["time", "totalXP", "careerFunding", "allTimeFunding", "traded", "stakeoutAt"])
+    back[k] = Math.max(0, num(back[k]));
+  for (const k of ["legacy", "patrols", "runs"]) back[k] = count(back[k]);
+  back.crew.n = count(back.crew.n);
+  back.crew.grow = Math.max(0, num(back.crew.grow));
+  back.crew.unpaid = Math.max(0, num(back.crew.unpaid));
+  /* crewSplit clamps assignments on read, but the tick works the raw map:
+     a negative or fractional job would otherwise ride the whole session */
+  for (const j of JOBS) back.crew.jobs[j.id] = count(back.crew.jobs[j.id]);
+  back.streak = { days: count(back.streak.days), last: count(back.streak.last) };
   return back;
 }
 
@@ -962,10 +981,21 @@ function combatStep(s, dt, d) {
     heroHP = d.resolve;
     return true;
   };
-  const settleable = !isBoss && ko <= 0 && d.winnable && d.ttkEff > 0 && Number.isFinite(d.ttkEff);
-  if (settleable && t / d.ttkEff >= TUNE.killBatch && settle(t)) t = 0;
+  /* Only ever between trash fights, on a fight the hero wins, with nobody
+     mid-knockout. Checked at each call site: the loop moves all three. */
+  const canSettle = () => !isBoss && ko <= 0 && d.winnable && d.ttkEff > 0 && Number.isFinite(d.ttkEff);
+  /* Two reasons to skip the loop: the fight is faster than it is worth
+     simulating one kill at a time, or the slice holds more kills than the
+     loop is budgeted for. The first is a rate, not a count, so live play,
+     the tests and a catch-up all cut over at the same strength instead of
+     at whatever slice length each happens to use.
+       A tapped ability is the player's, though. It has to fire, and the
+     settle would swallow it — no damage, no buff, no cooldown, a button
+     that looks broken — so a slice with one pending goes through the
+     loop and the next one settles. */
+  if (!cast && canSettle() && (1 / d.ttkEff >= TUNE.killBatch || t / d.ttkEff >= TUNE.fightSteps) && settle(t)) t = 0;
 
-  while (t > 1e-9 && guard++ < 5000) {
+  while (t > 1e-9 && guard++ < TUNE.fightSteps) {
     if (ko > 0) {
       const spend = Math.min(t, ko);
       ko -= spend; t -= spend; tick(spend);
@@ -1018,7 +1048,7 @@ function combatStep(s, dt, d) {
      the loop budget with time still on the clock. Settle the remainder
      the same way — throwing the hours away punished exactly the players
      farming fast kills. */
-  if (t > 1e-9 && !isBoss && d.winnable && d.ttkEff > 0 && Number.isFinite(d.ttkEff) && settle(t)) t = 0;
+  if (t > 1e-9 && canSettle() && settle(t)) t = 0;
   return { fight: { ...f, enemyHP, heroHP, ko, boss: isBoss, cd, buff, cast: [] }, xp, kills, bossWin, heroAtWin };
 }
 
