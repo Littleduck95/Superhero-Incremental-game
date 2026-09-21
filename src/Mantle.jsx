@@ -588,6 +588,39 @@ function crewSplit(s) {
   return { jobs, n, idle: n - used };
 }
 
+/* Putting a hand on a job. Crew put themselves to work the moment they
+   walk in, so idle is nearly always zero: if a move could only spend an
+   idle hand, the board would sit frozen for the whole game. So take an
+   idle one where there is one and pull off the fullest other job where
+   there isn't — one at a time, so filling a job drains the crowd rather
+   than emptying whichever job happens to be first. `max` puts the whole
+   outfit on it, `none` stands the job down. Returns the new assignments,
+   or null when nothing would move. */
+function assignCrew(s, jobId, n) {
+  const split = crewSplit(s);
+  const jobs = { ...split.jobs };
+  const have = jobs[jobId] || 0;
+  const want =
+    n === "max" ? split.n
+    : n === "none" ? 0
+    : Math.max(0, Math.min(have + n, split.n));
+  if (want < have) {
+    jobs[jobId] = want;
+    return jobs;
+  }
+  let need = want - have - Math.min(want - have, split.idle);
+  while (need > 0) {
+    let from = null;
+    for (const j of JOBS)
+      if (j.id !== jobId && jobs[j.id] > 0 && (!from || jobs[j.id] > jobs[from.id])) from = j;
+    if (!from) break;
+    jobs[from.id] -= 1;
+    need -= 1;
+  }
+  jobs[jobId] = want - need;
+  return jobs[jobId] === have ? null : jobs;
+}
+
 function derive(s, opts = {}) {
   const hero = heroById(s.hero);
   const tech = s.tech;
@@ -1344,7 +1377,7 @@ export const engine = {
   JOBS, PROJECTS, MARKET, ACHIEVEMENTS, FLASHPOINTS, CONTRACTS, METRICS, KEEPSAKES,
   freshState, migrate, derive, step, costOf, powerCost, canPay, maxAffordable,
   unlocked, bossReady, forecastBoss, startBoss, bestDistrict, levelOf,
-  crewSplit, projectCost, projectMax, projectAt, marketDip,
+  crewSplit, assignCrew, projectCost, projectMax, projectAt, marketDip,
   rollContracts, contractTick, settleBoard, windfall, mergeBoon, catchUp, msCrossed, msNext,
 };
 
@@ -1675,7 +1708,8 @@ function useGame() {
     `People who work for you. Safehouses are beds and beds are the only reason anyone stays, so ${d.beds} is your ceiling; one more walks in every ${Math.round(TUNE.crewJoin / (1 + 0.15 * d.held))}s while there is room. ` +
     `Payroll runs at ${rate(d.upkeep)} funding a second and climbs steeply with the size of the outfit — miss it for ${TUNE.crewQuit}s and somebody hands their key back. ` +
     `New hands put themselves to work on the way in${s.tech.command ? ", on whichever job has the fewest" : ", following whoever is busiest"}. ` +
-    (d.crew.idle ? `${d.crew.idle} of them are standing around doing nothing.` : `All ${d.crew.n} are working.`);
+    (d.crew.idle ? `${d.crew.idle} of them are standing around doing nothing.` : `All ${d.crew.n} are working.`) +
+    ` You can move anyone at any time: + on a job pulls off the fullest one when nobody is idle.`;
 
   const jobTip = (j) => {
     const n = d.crew.jobs[j.id] || 0;
@@ -1683,7 +1717,8 @@ function useGame() {
       ? Object.keys(j.makes).map((k) => `${rate(j.makes[k] * d.crewMult * d.mult[k] * ((d.hero?.mods || {})[k] || 1) * d.global)} ${nameOf(k).toLowerCase()}/s`).join(" and ")
       : j.combat ? `+${pct(j.combat * d.crewMult)} power and resolve`
       : `+${pct(j.xp * d.crewMult)} XP a kill`;
-    return `${j.blurb} Each hand on this is worth ${what}. ${n} assigned${s.tech.command ? ", and Chain of Command has them working half again as hard" : ""}.`;
+    return `${j.blurb} Each hand on this is worth ${what}. ${n} assigned${s.tech.command ? ", and Chain of Command has them working half again as hard" : ""}. ` +
+      `+ takes an idle hand if there is one and pulls off the fullest other job if there isn't; all puts the whole outfit of ${d.crew.n} on it; − stands one down.`;
   };
 
   const marketTip = (id) =>
@@ -1846,11 +1881,8 @@ function useGame() {
   /* ---- crew ---- */
   const assign = (jobId, n) =>
     setS((p) => {
-      const split = crewSplit(p);
-      const have = split.jobs[jobId] || 0;
-      const want = n === "max" ? have + split.idle : n === "none" ? 0 : Math.max(0, Math.min(have + n, have + split.idle));
-      if (want === have) return p;
-      return { ...p, crew: { ...p.crew, jobs: { ...split.jobs, [jobId]: want } } };
+      const jobs = assignCrew(p, jobId, n);
+      return jobs ? { ...p, crew: { ...p.crew, jobs } } : p;
     });
   const spreadCrew = () =>
     setS((p) => {
@@ -2389,7 +2421,13 @@ function Crew({ g }) {
       )}
       <div className="n-sec">
         <span className="n-sec-l">Assignments</span>
-        <span className="n-sec-s">{d.crew.idle} idle · idle hands still cost payroll</span>
+        <span className="n-sec-s">
+          {d.crew.idle
+            ? `${d.crew.idle} idle · idle hands still cost payroll`
+            : d.crew.n
+            ? "nobody idle · + pulls a hand off the fullest job"
+            : "nobody on the books yet"}
+        </span>
         <span className="n-modes">
           <button className="n-mode" onClick={g.spreadCrew}>split evenly</button>
           <button className="n-mode" onClick={g.clearCrew}>stand down</button>
@@ -2414,9 +2452,9 @@ function Crew({ g }) {
               <div className="n-item-bot">
                 <span className="n-sub">{what} each</span>
                 <span className="n-crew-btns">
-                  <button className="n-mode" disabled={!n} onClick={() => g.assign(j.id, -1)}>−</button>
-                  <button className="n-mode" disabled={!d.crew.idle} onClick={() => g.assign(j.id, 1)}>+</button>
-                  <button className="n-mode" disabled={!d.crew.idle} onClick={() => g.assign(j.id, "max")}>all</button>
+                  <button className="n-mode" title={`Take one off ${j.name}`} disabled={!n} onClick={() => g.assign(j.id, -1)}>−</button>
+                  <button className="n-mode" title={`One more on ${j.name} — an idle hand, or one off the fullest job`} disabled={n >= d.crew.n} onClick={() => g.assign(j.id, 1)}>+</button>
+                  <button className="n-mode" title={`The whole outfit on ${j.name}`} disabled={n >= d.crew.n} onClick={() => g.assign(j.id, "max")}>all</button>
                 </span>
               </div>
             </div>

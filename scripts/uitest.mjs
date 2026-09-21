@@ -1,7 +1,8 @@
 /* Drives the BUILT game in a real Chromium and checks what the engine
    tests can't: that the systems actually render and respond. Covers the
    flashpoint banner, patrol momentum, the bounty board and streak, a
-   stakeout round, the ticker, ownership marks, and the estate rite.
+   stakeout round, the ticker, ownership marks, the crew board, and the
+   estate rite.
      npm run test:ui
    The dependency is `playwright-core`, which drives a browser but ships
    none, so point CHROMIUM_PATH at a Chromium or Chrome binary if one
@@ -142,6 +143,41 @@ ok("the stakeout resolved to a cooldown", /next in/.test(await page.locator(".n-
 await page.getByRole("tab", { name: /Region/ }).click();
 await page.waitForTimeout(300);
 ok("a producer shows its next mark", /×2 at 25/.test(await page.locator(".n-item", { hasText: "ROOFTOP PERCH" }).innerText()));
+
+/* ---- the crew board: a hand can be moved with nobody idle ---- */
+/* Crew put themselves to work the moment they walk in, so a board that
+   could only spend idle hands was one no player could ever use. */
+const crewSeed = { at: Date.now(), state: { ...seeded.state, own: { ...seeded.state.own, safehouse: 2 }, res: { ...seeded.state.res, funding: 200000 },
+  crew: { n: 8, grow: 0, unpaid: 0, jobs: { beat: 8, scavenge: 0, outreach: 0, sparring: 0, intel: 0 } }, flash: null } };
+const pageCrew = await (await browser.newContext()).newPage();
+pageCrew.on("pageerror", (e) => fail("crew page error: " + e.message));
+await pageCrew.addInitScript((s) => localStorage.setItem("mantle:hero:v3", JSON.stringify(s)), crewSeed);
+await pageCrew.goto(URL);
+await pageCrew.waitForTimeout(1200);
+await pageCrew.getByRole("tab", { name: /Crew/ }).click();
+await pageCrew.waitForTimeout(300);
+const heads = async () => {
+  const out = {};
+  for (const row of await pageCrew.locator(".n-job").all())
+    out[(await row.locator(".n-name").innerText()).trim()] = Number(await row.locator(".n-count").innerText());
+  return out;
+};
+const crewStart = await heads();
+ok("the outfit starts on one job with nobody idle", crewStart["STREET BEAT"] === 8 && /nobody idle/.test(await pageCrew.locator(".n-sec-s").nth(1).innerText()));
+const sparPlus = pageCrew.locator(".n-job", { hasText: "SPARRING" }).locator(".n-crew-btns button", { hasText: "+" });
+ok("+ is offered with nobody idle", !(await sparPlus.isDisabled()));
+await sparPlus.click();
+await pageCrew.waitForTimeout(250);
+const crewMoved = await heads();
+ok("+ moves a hand off the fullest job", crewMoved["SPARRING"] === 1 && crewMoved["STREET BEAT"] === 7, JSON.stringify(crewMoved));
+ok("+ moves, it does not hire", Object.values(crewMoved).reduce((a, b) => a + b, 0) === 8, JSON.stringify(crewMoved));
+await pageCrew.locator(".n-job", { hasText: "INTEL DESK" }).locator(".n-crew-btns button", { hasText: "all" }).click();
+await pageCrew.waitForTimeout(250);
+const crewAll = await heads();
+ok("all puts the whole outfit on one job", crewAll["INTEL DESK"] === 8, JSON.stringify(crewAll));
+await pageCrew.getByRole("button", { name: "stand down" }).click();
+await pageCrew.waitForTimeout(250);
+ok("stand down frees everyone", /8 idle/.test(await pageCrew.locator(".n-sec-s").nth(1).innerText()));
 
 /* ---- the estate rite: confirm the pass, take a keepsake ---- */
 const rich = { at: Date.now(), state: { ...seeded.state, hero: "bastion", tech: { mantle: true }, careerFunding: 9e9, flash: null } };

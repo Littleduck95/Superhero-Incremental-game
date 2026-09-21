@@ -180,7 +180,52 @@ ok("a junk estate can't poison the stats", Number.isFinite(dk.power) && Number.i
 ok("an unknown keepsake is ignored", Number.isFinite(dk.kpCount) && dk.kpCount === 2, "count " + dk.kpCount);
 ok("a drawn estate keeps only real ids", junkKeep.estate.picks.join() === "bag", junkKeep.estate.picks.join());
 
-/* 16. every tech, job and project id is sane and reachable */
+/* 16. the crew board: a hand can always be moved, idle or not. Crew put
+      themselves to work the moment they walk in, so a board that could
+      only spend idle hands was a board nobody could ever use. */
+const outfit = (n, jobs) => ({
+  ...E.migrate(null), hero: "grayline",
+  own: { ...E.freshState().own, safehouse: 4 },
+  crew: { n, grow: 0, unpaid: 0, jobs: { beat: 0, scavenge: 0, outreach: 0, sparring: 0, intel: 0, ...jobs } },
+});
+const sum = (jobs) => E.JOBS.reduce((t, j) => t + (jobs[j.id] || 0), 0);
+
+const packed = outfit(8, { beat: 8 });
+ok("nobody is idle with the whole outfit on one job", E.crewSplit(packed).idle === 0);
+let moved = E.assignCrew(packed, "scavenge", 1);
+ok("+ moves a hand with nobody idle", moved && moved.scavenge === 1 && moved.beat === 7, JSON.stringify(moved));
+ok("+ moves one hand, not two", moved && sum(moved) === 8, JSON.stringify(moved));
+
+const evened = outfit(8, { beat: 5, scavenge: 3 });
+ok("+ pulls off the fullest job", E.assignCrew(evened, "intel", 1).beat === 4);
+ok("all takes the whole outfit", sum(E.assignCrew(evened, "outreach", "max")) === 8 && E.assignCrew(evened, "outreach", "max").outreach === 8);
+ok("none stands a job down", E.assignCrew(evened, "beat", "none").beat === 0);
+ok("- frees a hand rather than moving one", E.assignCrew(evened, "beat", -1).beat === 4 && sum(E.assignCrew(evened, "beat", -1)) === 7);
+
+ok("+ on a job that already holds everyone is a no-op", E.assignCrew(packed, "beat", 1) === null);
+ok("all on a job that already holds everyone is a no-op", E.assignCrew(packed, "beat", "max") === null);
+ok("- on an empty job is a no-op", E.assignCrew(packed, "intel", -1) === null);
+ok("an empty outfit has nothing to move", E.assignCrew(outfit(0, {}), "beat", 1) === null && E.assignCrew(outfit(0, {}), "beat", "max") === null);
+
+const idling = outfit(8, { beat: 2 });
+ok("idle hands go first", E.assignCrew(idling, "intel", 1).beat === 2 && E.assignCrew(idling, "intel", 1).intel === 1);
+ok("all sweeps up the idle too", E.assignCrew(idling, "intel", "max").intel === 8);
+
+/* an overstuffed save (a safehouse lost, a hand walked) is clamped on read,
+   and a move off it can never conjure people who left */
+const overstuffed = outfit(3, { beat: 9, scavenge: 4 });
+ok("a stale assignment is clamped before it is moved", sum(E.assignCrew(overstuffed, "intel", "max")) === 3);
+ok("clamped moves keep the outfit whole", E.assignCrew(overstuffed, "intel", 1) && sum(E.assignCrew(overstuffed, "intel", 1)) === 3);
+
+/* the tick must not undo the player: a choice survives live play */
+let chosen = outfit(8, { beat: 8 });
+chosen = { ...chosen, crew: { ...chosen.crew, jobs: E.assignCrew(chosen, "sparring", "max") } };
+chosen.res = { leads: 0, salvage: 0, funding: 1e9, xp: 0 };
+for (let t = 0; t < 120; t++) chosen = E.step(chosen, 1, { quiet: true });
+ok("the tick keeps the player's assignment", chosen.crew.jobs.sparring >= 8, JSON.stringify(chosen.crew.jobs));
+ok("new hands still put themselves to work", E.crewSplit(chosen).idle === 0, "idle " + E.crewSplit(chosen).idle);
+
+/* 17. every tech, job and project id is sane and reachable */
 const ids = new Set();
 for (const t of E.TECH) { ok("tech id unique: " + t.id, !ids.has(t.id)); ids.add(t.id); }
 for (const t of E.TECH) for (const r of t.req) ok(`${t.id} requires a real node`, ids.has(r), r);
