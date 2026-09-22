@@ -343,12 +343,18 @@ ok("60 seconds pays the same however it is sliced",
   perSlice.every((v) => Math.abs(v - perSlice[0]) <= perSlice[0] * 0.05), perSlice.join(" / "));
 
 /* the batch is a shortcut, not a payout: it must land where the full
-   simulation lands */
+   simulation lands.
+     The settle runs on an average, so it can only be fair over a window
+   long enough to average. A fight opens with everything off cooldown, so
+   it gets one activation the steady rate never pays for, and Surge's
+   cycle is now its run plus the recharge that follows it — four of them
+   in thirty seconds, which made that one opening worth three percent of
+   the whole window. Five minutes is the steady state being modelled. */
 const batched = fighter(120, 80, 40, 120, "flats");
-const withBatch = ranAt(batched, 30);
+const withBatch = ranAt(batched, 300);
 const realBatch = E.TUNE.killBatch;
 E.TUNE.killBatch = Infinity;
-const without = ranAt(batched, 30);
+const without = ranAt(batched, 300);
 E.TUNE.killBatch = realBatch;
 ok("the batched settle pays what simulating every kill pays",
   Math.abs(withBatch - without) <= without * 0.02, `${withBatch} vs ${without}`);
@@ -372,6 +378,58 @@ for (const t of E.TECH) for (const r of t.req) ok(`${t.id} requires a real node`
 ok("every achievement has a test", E.ACHIEVEMENTS.every((a) => typeof a.test === "function"));
 const fresh = E.freshState();
 for (const a of E.ACHIEVEMENTS) { try { a.test(fresh, { level: 1 }); } catch (e) { fails++; console.log("FAIL achievement " + a.id + ": " + e.message); } }
+
+/* 19. a timed ability recharges after it drops, not through itself */
+const bracer = fighter(30, 20, 10, 0, "flats");
+bracer.tech = { ...bracer.tech, triggers: false };
+const bd = E.derive(bracer);
+const braceA = bd.abilities.find((a) => a.id === "brace");
+const hayA = bd.abilities.find((a) => a.id === "haymaker");
+ok("a timed ability's cycle is its run plus its recharge",
+  Math.abs(braceA.cycle - (braceA.cd + braceA.dur)) < 1e-9, `${braceA.cycle} vs ${braceA.cd} + ${braceA.dur}`);
+ok("an instant one has nothing to wait through", Math.abs(hayA.cycle - hayA.cd) < 1e-9, `${hayA.cycle} vs ${hayA.cd}`);
+
+const braced = E.step({ ...bracer, fight: { ...bracer.fight, cast: ["brace"] } }, 0.5, { quiet: true });
+ok("firing it banks the whole cycle",
+  Math.abs((braced.fight.cd.brace || 0) - (braceA.cycle - 0.5)) < 1e-6, `${braced.fight.cd.brace} vs ${braceA.cycle - 0.5}`);
+ok("so the recharge still owed when it drops is the whole recharge",
+  Math.abs((braced.fight.cd.brace || 0) - (braced.fight.buff.brace || 0) - braceA.cd) < 1e-6,
+  `cd ${braced.fight.cd.brace} buff ${braced.fight.buff.brace} vs ${braceA.cd}`);
+let held = braced;
+for (let i = 0; i < 200 && (held.fight.buff.brace || 0) > 0; i++) held = E.step(held, 0.25, { quiet: true });
+ok("and the clock the player watches only starts then",
+  !(held.fight.buff.brace > 0) && (held.fight.cd.brace || 0) > braceA.cd - 0.25 - 1e-6
+    && (held.fight.cd.brace || 0) <= braceA.cd + 1e-6,
+  `cd ${held.fight.cd.brace} vs ${braceA.cd}`);
+
+/* cut short, it hands back the seconds it never got to spend */
+const weak = fighter(1, 0, 0, 0, "midtown");
+weak.tech = { ...weak.tech, triggers: false };
+const wd = E.derive(weak);
+const wBrace = wd.abilities.find((a) => a.id === "brace");
+let dropped = { ...weak, fight: { ...E.startBoss(wd), cast: ["brace"] } };
+let spent = 0;
+while (dropped.fight.ko <= 0 && spent < 20) { dropped = E.step(dropped, 0.1, { quiet: true }); spent += 0.1; }
+ok("a guard cut short by a knockout hands the unspent recharge back",
+  dropped.fight.ko > 0 && spent < wBrace.dur && !dropped.fight.boss
+    && Math.abs((dropped.fight.cd.brace || 0) - wBrace.cd) <= 0.1 + 1e-6,
+  `down at ${spent.toFixed(1)}s, cd ${dropped.fight.cd.brace} vs ${wBrace.cd}`);
+
+/* 20. power ranks buy in bulk on the Ops buy modes */
+const impact = E.POWERS.find((p) => p.id === "impact");
+let singles = 0;
+for (let i = 0; i < 10; i++) singles += E.powerCost(impact, 3 + i).xp;
+ok("ten ranks cost what ten singles cost", E.powerCostN(impact, 3, 10).xp === singles,
+  `${E.powerCostN(impact, 3, 10).xp} vs ${singles}`);
+ok("a run of one is just the rank", E.powerCostN(impact, 7, 1).xp === E.powerCost(impact, 7).xp);
+ok("a run of none is free", E.powerCostN(impact, 7, 0).xp === 0);
+const purse = { xp: E.powerCostN(impact, 0, 6).xp };
+ok("max takes every rank the XP covers", E.powerMax(impact, 0, purse) === 6, "got " + E.powerMax(impact, 0, purse));
+ok("and never the one it does not", E.powerCostN(impact, 0, 7).xp > purse.xp);
+ok("no XP buys no ranks", E.powerMax(impact, 0, { xp: 0 }) === 0);
+ok("the Mind discount carries through a whole run",
+  E.powerCostN(impact, 0, 5, 0.5).xp < E.powerCostN(impact, 0, 5).xp &&
+  E.powerMax(impact, 0, purse, 0.5) > E.powerMax(impact, 0, purse));
 
 console.log(fails ? `\n${fails} FAILED` : "\nall good");
 process.exit(fails ? 1 : 0);

@@ -1,8 +1,9 @@
 /* Drives the BUILT game in a real Chromium and checks what the engine
    tests can't: that the systems actually render and respond. Covers the
    flashpoint banner, patrol momentum, the bounty board and streak, a
-   stakeout round, the ticker, ownership marks, the crew board, the
-   1-4 ability keys, and the estate rite.
+   stakeout round, the ticker, ownership marks, the crew board, the Ops
+   buy modes on the Powers tab, the 1-4 ability keys, and the estate
+   rite.
      npm run test:ui
    The dependency is `playwright-core`, which drives a browser but ships
    none, so point CHROMIUM_PATH at a Chromium or Chrome binary if one
@@ -78,7 +79,7 @@ const up = async () => {
 if (!(await up())) { console.log("FAIL preview server never came up — run `npm run build` first"); stopServer(); process.exit(1); }
 
 let browser;
-let crewCtx, keysCtx, riteCtx, bootCtx;
+let crewCtx, powersCtx, keysCtx, riteCtx, bootCtx;
 try {
   browser = await chromium.launch({ executablePath: findChromium() });
 } catch (e) {
@@ -181,6 +182,39 @@ await pageCrew.getByRole("button", { name: "stand down" }).click();
 await pageCrew.waitForTimeout(250);
 ok("stand down frees everyone", /8 idle/.test(await pageCrew.locator(".n-sec-s").nth(1).innerText()));
 
+/* ---- the Ops buy modes reach power ranks, not just gear and region ---- */
+const powersSeed = { at: Date.now(), state: { ...seeded.state, flash: null,
+  res: { ...seeded.state.res, xp: 5000 }, ranks: { impact: 1 },
+  tech: { bulkorders: true, logistics: true } } };
+powersCtx = await browser.newContext();
+const pagePowers = await powersCtx.newPage();
+pagePowers.on("pageerror", (e) => fail("powers page error: " + e.message));
+await pagePowers.addInitScript((s) => localStorage.setItem("mantle:hero:v3", JSON.stringify(s)), powersSeed);
+await pagePowers.goto(URL);
+await pagePowers.waitForTimeout(1200);
+await pagePowers.getByRole("tab", { name: /Powers/ }).click();
+await pagePowers.waitForTimeout(300);
+const powerModes = await pagePowers.locator(".n-modes .n-mode").allInnerTexts();
+ok("Bulk Orders and Logistics reach the Powers tab", powerModes.join(" ") === "×1 ×10 max", powerModes.join(" "));
+const impact = pagePowers.locator(".n-item", { hasText: "IMPACT" });
+ok("a rank starts where the save left it", /rank 1/.test(await impact.locator(".n-count").innerText()));
+await pagePowers.getByRole("button", { name: "×10", exact: true }).click();
+await pagePowers.waitForTimeout(250);
+ok("the price says how many it is buying", (await impact.locator(".n-multi").innerText()) === "×10");
+await impact.click();
+await pagePowers.waitForTimeout(250);
+ok("×10 buys ten ranks in one tap", /rank 11/.test(await impact.locator(".n-count").innerText()),
+  await impact.locator(".n-count").innerText());
+await pagePowers.getByRole("button", { name: "max", exact: true }).click();
+await pagePowers.waitForTimeout(250);
+const reflex = pagePowers.locator(".n-item", { hasText: "REFLEX" });
+const reflexMax = Number((await reflex.locator(".n-multi").innerText()).replace("×", ""));
+await reflex.click();
+await pagePowers.waitForTimeout(250);
+ok("max buys every rank the XP covers", reflexMax > 1
+  && Number((await reflex.locator(".n-count").innerText()).replace(/\D/g, "")) >= reflexMax,
+  `offered ×${reflexMax}, got ${await reflex.locator(".n-count").innerText()}`);
+
 /* ---- the keyboard: 1-4 fire abilities, and only on the fight tab ---- */
 keysCtx = await browser.newContext();
 const pageKeys = await keysCtx.newPage();
@@ -266,7 +300,7 @@ ok("fresh boot shows hero select", (await page2.locator(".n-hero").count()) === 
 } finally {
   /* each context is a whole browser profile: close them rather than
      leaving them open until the browser goes down at the end */
-  for (const ctx of [crewCtx, keysCtx, riteCtx, bootCtx])
+  for (const ctx of [crewCtx, powersCtx, keysCtx, riteCtx, bootCtx])
     if (ctx) { try { await ctx.close(); } catch { /* already down */ } }
   try { await browser.close(); } catch { /* already down */ }
   stopServer();

@@ -807,11 +807,16 @@ function derive(s, opts = {}) {
   /* abilities: the tree opens them, the two buildings and Tempo shape them */
   const cdMult = projCd * (tech.tempo ? 0.75 : 1) * (1 - Math.min(0.5, kp.cd)) / (1 + TUNE.safehouseEach * (s.own.safehouse || 0));
   const abilMult = 1 + TUNE.gymEach * (s.own.gym || 0);
+  /* `cycle` is what one use actually costs you in time: a timed ability
+     only starts recharging once it drops, so Brace and Surge come back
+     round in dur + cd, not cd. Everything that prices an ability over
+     time — the readouts, the recharge bar, the fight itself — goes
+     through this rather than the bare recharge. */
   const abilities = ABILITIES.filter((a) => tech[a.tech]).map((a) => {
     const cd = a.cd * cdMult;
+    const dur = a.dur ? Math.min(a.dur * abilMult, cd * 0.9) : 0;
     return {
-      ...a, cd,
-      dur: a.dur ? Math.min(a.dur * abilMult, cd * 0.9) : 0,
+      ...a, cd, dur, cycle: cd + dur,
       amount: a.kind === "hit" ? a.mag * power * abilMult
         : a.kind === "heal" ? Math.min(resolve, a.mag * resolve * abilMult)
         : a.mag,
@@ -831,8 +836,8 @@ function derive(s, opts = {}) {
      twenty-five times the kills the fight could ever deliver. */
   let burst = 0;
   for (const a of abilities) {
-    if (a.kind === "hit") burst += Math.min(a.amount, dist.hp) / a.cd;
-    else if (a.kind === "boost") burst += power * (a.mag - 1) * a.dur / a.cd;
+    if (a.kind === "hit") burst += Math.min(a.amount, dist.hp) / a.cycle;
+    else if (a.kind === "boost") burst += power * (a.mag - 1) * a.dur / a.cycle;
   }
   const sustain = auto ? power + burst : power;
 
@@ -875,6 +880,27 @@ function costOf(item, own, count, discount = 1) {
 }
 
 const powerCost = (p, rank, discount = 1) => ({ xp: Math.ceil(p.base * Math.pow(p.growth, rank) * discount) });
+
+/* A run of ranks, each one rounded on its own, so ×10 and max charge
+   exactly what buying them one at a time would have. Ranks grow fast
+   enough that the walk is a few dozen steps at most. */
+const powerCostN = (p, rank, n, discount = 1) => {
+  let xp = 0;
+  for (let i = 0; i < n; i++) xp += Math.ceil(p.base * Math.pow(p.growth, rank + i) * discount);
+  return { xp };
+};
+
+/* The most ranks the XP on hand covers, capped like maxAffordable. */
+function powerMax(p, rank, res, discount = 1) {
+  let n = 0, spent = 0;
+  while (n < 1000) {
+    const next = spent + Math.ceil(p.base * Math.pow(p.growth, rank + n) * discount);
+    if (!(next <= res.xp)) break;
+    spent = next;
+    n++;
+  }
+  return n;
+}
 
 /* What `share` of the next copy of a project costs. Progress is kept, so
    a project can be paid for in any number of slices. */
@@ -953,14 +979,29 @@ function combatStep(s, dt, d) {
     for (const k in cd) { cd[k] -= dt; if (cd[k] <= 1e-9) delete cd[k]; }
     for (const k in buff) { buff[k] -= dt; if (buff[k] <= 1e-9) delete buff[k]; }
   };
+  /* The recharge is banked as dur + cd and ticks down alongside the buff,
+     so the clock the player watches only starts moving on the recharge
+     once the ability has run out. No second timer, and a save from
+     before this reads as an ability part-way through its recharge. */
   const fire = (a) => {
     if (a.kind === "hit") enemyHP -= a.amount;
     else if (a.kind === "heal") heroHP = Math.min(d.resolve, heroHP + a.amount);
     else buff[a.id] = a.dur;
-    cd[a.id] = a.cd;
+    cd[a.id] = a.cycle;
+  };
+  /* A buff cut short — a boss down, or the hero — hands back the seconds
+     it never got to spend, so ending a fight early can't cost recharge. */
+  const dropBuffs = () => {
+    for (const k in buff) {
+      const left = buff[k];
+      delete buff[k];
+      if (!(cd[k] > 0)) continue;
+      cd[k] -= left;
+      if (cd[k] <= 1e-9) delete cd[k];
+    }
   };
   const win = () => {
-    if (isBoss) { bossWin = true; heroAtWin = heroHP; isBoss = false; xp += boss.xp * d.xpMult; for (const k in buff) delete buff[k]; }
+    if (isBoss) { bossWin = true; heroAtWin = heroHP; isBoss = false; xp += boss.xp * d.xpMult; dropBuffs(); }
     else { kills++; xp += dist.xp * d.xpMult; }
     enemyHP = foeHP();
     heroHP = d.resolve;
@@ -1041,7 +1082,7 @@ function combatStep(s, dt, d) {
     if (enemyHP <= 1e-9) win();
     else if (heroHP <= 1e-9) {
       heroHP = 0; ko = d.ko;
-      if (isBoss) { isBoss = false; for (const k in buff) delete buff[k]; }
+      if (isBoss) { isBoss = false; dropBuffs(); }
     }
   }
   /* A huge catch-up in a district that dies in milliseconds can exhaust
@@ -1447,7 +1488,7 @@ const toneOf = (id) => RESOURCES.find((r) => r.id === id)?.tone ?? "plain";
 export const engine = {
   RESOURCES, HEROES, POWERS, DISTRICTS, ABILITIES, GEAR, TERRITORY, TECH, TUNE,
   JOBS, PROJECTS, MARKET, ACHIEVEMENTS, FLASHPOINTS, CONTRACTS, METRICS, KEEPSAKES,
-  freshState, migrate, derive, step, costOf, powerCost, canPay, maxAffordable,
+  freshState, migrate, derive, step, costOf, powerCost, powerCostN, powerMax, canPay, maxAffordable,
   unlocked, bossReady, forecastBoss, startBoss, bestDistrict, levelOf,
   crewSplit, assignCrew, projectCost, projectMax, projectAt, marketDip,
   rollContracts, contractTick, settleBoard, windfall, mergeBoon, catchUp, msCrossed, msNext,
@@ -1699,11 +1740,14 @@ function useGame() {
       : a.kind === "guard" ? `cuts incoming damage by ${pct(a.mag)} for ${a.dur.toFixed(1)}s`
       : a.kind === "heal" ? `heals ${amt(a.amount)} resolve on the spot`
       : `doubles your damage for ${a.dur.toFixed(1)}s`;
-    return `${a.blurb} ${a.name} ${what}, then recharges for ${a.cd.toFixed(1)}s. Key ${a.key}. Safehouses shorten the recharge, Training Floors raise what it does${d.auto ? ", and Reflex Triggers fires it for you" : ""}.`;
+    const back = a.dur
+      ? `then starts its ${a.cd.toFixed(1)}s recharge once it drops — ${a.cycle.toFixed(1)}s from tap to tap`
+      : `then recharges for ${a.cd.toFixed(1)}s`;
+    return `${a.blurb} ${a.name} ${what}, ${back}. Key ${a.key}. Safehouses shorten the recharge, Training Floors raise what it does${d.auto ? ", and Reflex Triggers fires it for you" : ""}.`;
   };
 
   const abilitiesTip = () =>
-    d.abilities.map((a) => `${a.name} (${a.key}): ${a.kind === "hit" ? amt(a.amount) + " damage" : a.kind === "guard" ? "−" + pct(a.mag) + " damage taken for " + a.dur.toFixed(1) + "s" : a.kind === "heal" ? "heal " + amt(a.amount) : "×" + a.mag + " damage for " + a.dur.toFixed(1) + "s"}, ${a.cd.toFixed(1)}s recharge.`).join(" ") +
+    d.abilities.map((a) => `${a.name} (${a.key}): ${a.kind === "hit" ? amt(a.amount) + " damage" : a.kind === "guard" ? "−" + pct(a.mag) + " damage taken for " + a.dur.toFixed(1) + "s" : a.kind === "heal" ? "heal " + amt(a.amount) : "×" + a.mag + " damage for " + a.dur.toFixed(1) + "s"}, ${a.cd.toFixed(1)}s recharge${a.dur ? " after it drops" : ""} — ${a.cycle.toFixed(1)}s between uses.`).join(" ") +
     (d.auto ? " Reflex Triggers fires them on recharge." : " Tap, or press the key. Reflex Triggers in Ops fires them for you.");
 
   const resMod = (d.hero?.mods || {}).resolve || 1;
@@ -1759,7 +1803,7 @@ function useGame() {
     const a = t.ability && abilityById(t.ability);
     return (
       `${techEffect(t)}. ` +
-      (a ? `${a.blurb} Recharges in ${a.cd}s. ` : "") +
+      (a ? `${a.blurb} ${a.dur ? `Runs for ${a.dur}s, then recharges in ${a.cd}s` : `Recharges in ${a.cd}s`}. ` : "") +
       `Bought once and it holds for the rest of this career. ` +
       (missing.length ? `Still needs: ${missing.join(", ")}. ` : "") +
       (opens.length ? `Opens: ${opens.join(", ")}.` : "Nothing else is waiting on it.")
@@ -1941,13 +1985,17 @@ function useGame() {
   const dequeue = (i) => setS((p) => ({ ...p, queue: p.queue.filter((_, n) => n !== i) }));
   const clearQueue = () => setS((p) => ({ ...p, queue: [] }));
 
+  /* Ranks buy in bulk on the Ops buy modes, the same as gear and the
+     region: Bulk Orders adds ×10 here too, Logistics adds max. */
   const train = (pw) =>
     setS((p) => {
       const dd = derive(p);
       const rank = p.ranks[pw.id] || 0;
-      const cost = powerCost(pw, rank, dd.cut.rank);
-      if (!canPay(cost, p.res)) return p;
-      return { ...p, res: { ...p.res, xp: p.res.xp - cost.xp }, ranks: { ...p.ranks, [pw.id]: rank + 1 } };
+      const max = powerMax(pw, rank, p.res, dd.cut.rank);
+      const n = mode === "max" ? max : Math.min(mode, max);
+      if (n < 1) return p;
+      const cost = powerCostN(pw, rank, n, dd.cut.rank);
+      return { ...p, res: { ...p.res, xp: p.res.xp - cost.xp }, ranks: { ...p.ranks, [pw.id]: rank + n } };
     });
 
   /* ---- crew ---- */
@@ -2098,6 +2146,16 @@ function useGame() {
   };
   const priceTerr = priceIn("own", "terr");
   const priceGear = priceIn("gear", "gear");
+  /* Powers sit in their own bucket and cost XP alone, but they price off
+     the same buy mode the other two do. */
+  const pricePower = (pw) => {
+    const rank = s.ranks[pw.id] || 0;
+    const max = mode === "max" ? powerMax(pw, rank, s.res, d.cut.rank) : 0;
+    const n = mode === "max" ? Math.max(1, max) : mode;
+    const cost = powerCostN(pw, rank, n, d.cut.rank);
+    const ok = mode === "max" ? max > 0 : canPay(cost, s.res);
+    return { rank, max, n, cost, ok };
+  };
 
   const yieldOf = (t) =>
     t.id === "lockup" ? `+${amt(TUNE.capEach.leads * d.capMult)} leads & salvage, +${amt(TUNE.capEach.funding * d.capMult)} funding held`
@@ -2162,7 +2220,7 @@ function useGame() {
     projectAt: (pr) => projectAt(s, pr),
     projectMax: (pr) => projectMax(s, pr, d.cut.tech),
     enqueue, dequeue, clearQueue, queued,
-    priceTerr, priceGear,
+    priceTerr, priceGear, pricePower,
     yieldOf, gearLine, techCost: (t) => costOf(t, 0, 1, d.cut.tech), techState, canBuyTech,
     branchTech, branchDone, branchTotal,
     foe: d.dist.foes[(s.cleared[d.dist.id] || 0) % d.dist.foes.length],
@@ -2298,14 +2356,16 @@ function Abilities({ g }) {
         const on = s.fight.buff[a.id] || 0;
         const pending = s.fight.cast.includes(a.id);
         const ready = !down && cd <= 0 && !pending;
-        const fill = cd > 0 ? 1 - cd / a.cd : 1;
+        /* clamped: buying a Safehouse mid-recharge shortens the cycle
+           under a timer already running against the old one */
+        const fill = cd > 0 ? Math.max(0, Math.min(1, 1 - cd / a.cycle)) : 1;
         return (
           <button
             key={a.id}
             className={"n-abil " + (on > 0 ? "on" : ready ? "ready" : "cool")}
             disabled={!ready}
             onClick={() => g.cast(a.id)}
-            aria-label={`${a.name}, ${ready ? "ready" : "recharging"}`}
+            aria-label={`${a.name}, ${ready ? "ready" : on > 0 ? "active" : "recharging"}`}
             {...g.hoverTip("a-" + a.id, a.name, g.abilityTip(a))}
           >
             <span className="n-abil-fill" style={{ width: pct(fill) }} />
@@ -3069,13 +3129,12 @@ export default function Mantle() {
 
           {g.tab === "powers" && (
             <>
-              <Section label="Powers" sub="ranks cost XP · your level never drops" g={g} />
+              <Section label="Powers" sub="ranks cost XP · your level never drops" g={g} modes />
               <div className="n-list">
                 {d.powers.map((p) => {
-                  const rank = s.ranks[p.id] || 0;
+                  const { rank, max, n, cost, ok } = g.pricePower(p);
                   const amped = POWER_AMP[p.id] && s.tech[POWER_AMP[p.id]];
                   const per = p.per * (amped ? 2 : 1);
-                  const cost = powerCost(p, rank, d.cut.rank);
                   const target =
                     p.target === "global" ? "everything" :
                     p.target === "patrol" ? "patrols" :
@@ -3089,10 +3148,11 @@ export default function Mantle() {
                       count={rank}
                       countLabel={"rank " + rank}
                       sub={`+${pct(per)} ${target} per rank${amped ? " (doubled)" : ""} · now ${x(1 + per * rank)}`}
-                      note={g.etaLabel(cost, canPay(cost, s.res)) ? ` · ${g.etaLabel(cost, canPay(cost, s.res))}` : null}
+                      note={g.etaLabel(cost, ok) ? ` · ${g.etaLabel(cost, ok)}` : null}
                       cost={cost}
                       res={s.res}
-                      ok={canPay(cost, s.res)}
+                      ok={ok}
+                      multi={g.mode === "max" ? "×" + Math.max(1, max) : g.mode > 1 ? "×" + n : null}
                       onBuy={() => g.train(p)}
                       tip={tipProps("pw-" + p.id, p.name, g.powerTip(p))}
                     />

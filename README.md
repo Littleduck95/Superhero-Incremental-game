@@ -34,11 +34,14 @@ A superhero incremental game: pick a hero, hold a city, get stronger.
   the career: region output, resolve, power, XP, storage, recharge.
 - **Fight** — an auto battler. Gear sets your base stats, powers multiply
   them, and four abilities on cooldowns (Haymaker, Brace, Second Wind, Surge)
-  spend them well; tap them or press 1–4. Every district ends in a boss that
-  turns nasty at 40% health. Beating it opens the next district, pays an XP
-  jackpot and a bounty, and holds the district for +10% region output. Fights
-  are the only source of XP.
+  spend them well; tap them or press 1–4. Brace and Surge run for a few
+  seconds first and only start recharging once they drop, so one use costs
+  you the whole of both. Every district ends in a boss that turns nasty at
+  40% health. Beating it opens the next district, pays an XP jackpot and a
+  bounty, and holds the district for +10% region output. Fights are the only
+  source of XP.
 - **Powers** — ranks bought with XP, multiplying region output and combat.
+  The Ops buy modes work here too: Bulk Orders adds ×10, Logistics adds max.
 - **Record** — achievements, each worth a little of everything, and the one
   thing besides legacy that survives passing the cowl on.
 - **Bounties** — the board opens with the first boss. Three contracts a day,
